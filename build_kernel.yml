@@ -1,0 +1,104 @@
+name: Build Hybrid Kernel for XZP (LOS 22 Target)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    
+    steps:
+    - name: Maximize Build Space
+      uses: easimon/maximize-build-space@master
+      with:
+        root-reserve-mb: 2048
+        swap-size-mb: 10240
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-codeql: 'true'
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python3 python-is-python3
+
+    - name: Install Repo
+      run: |
+        mkdir -p ~/bin
+        curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+        chmod a+x ~/bin/repo
+        echo "$HOME/bin" >> $GITHUB_PATH
+        git config --global user.name "GitHub Action"
+        git config --global user.email "action@github.com"
+
+    - name: Initialize Repo (关键修改点！)
+      run: |
+        mkdir lineage
+        cd lineage
+        
+        # 1. 这里必须是 lineage-22.0！
+        # 这样生成的 Ramdisk 才能引导你的 Android 15 系统
+        repo init -u https://github.com/LineageOS/android.git -b lineage-22.0 --depth=1
+        
+        # 2. 修改 Manifest，拉取 LOS 21 的代码
+        mkdir -p .repo/local_manifests
+        cat <<EOF > .repo/local_manifests/roomservice.xml
+        <?xml version="1.0" encoding="UTF-8"?>
+        <manifest>
+            <project name="whatawurst/android_kernel_sony_msm8998" path="kernel/sony/msm8998" remote="github" revision="lineage-21" />
+            
+            <project name="whatawurst/android_device_sony_yoshino-common" path="device/sony/yoshino-common" remote="github" revision="lineage-21" />
+            
+            <project name="LineageOS/android_device_sony_maple" path="device/sony/maple" remote="github" revision="lineage-21" />
+            
+            <project name="whatawurst/android_vendor_sony_poplar_kddi" path="vendor/sony/poplar_kddi" remote="github" revision="lineage-21" />
+            <project name="whatawurst/android_vendor_sony_yoshino-common" path="vendor/sony/yoshino-common" remote="github" revision="lineage-21" />
+        </manifest>
+        EOF
+
+    - name: Sync Source
+      working-directory: ./lineage
+      run: |
+        # 忽略版本不匹配的标签错误
+        repo sync -c -j$(nproc) --force-sync --no-clone-bundle --no-tags
+
+    - name: Apply NFC Fixes (再次确认补丁)
+      working-directory: ./lineage
+      run: |
+        echo "=== 开启内核 CXD224X 驱动 ==="
+        CONFIG_PATH="kernel/sony/msm8998/arch/arm64/configs/lineage_yoshino_defconfig"
+        
+        # 确保 CONFIG_SONY_CXD224X=y 存在
+        if ! grep -q "CONFIG_SONY_CXD224X=y" "$CONFIG_PATH"; then
+            echo "" >> $CONFIG_PATH
+            echo "CONFIG_SONY_CXD224X=y" >> $CONFIG_PATH
+        fi
+
+        echo "=== 搬运驱动文件 ==="
+        mkdir -p vendor/sony/maple/proprietary/vendor/firmware
+        mkdir -p vendor/sony/maple/proprietary/vendor/bin/hw
+        mkdir -p vendor/sony/maple/proprietary/vendor/lib64
+        
+        cp -r vendor/sony/poplar_kddi/proprietary/vendor/firmware/libpn553* vendor/sony/maple/proprietary/vendor/firmware/ || true
+        cp -r vendor/sony/poplar_kddi/proprietary/vendor/bin/hw/*sony* vendor/sony/maple/proprietary/vendor/bin/hw/ || true
+        cp vendor/sony/poplar_kddi/proprietary/vendor/lib64/libnfc-nci.conf vendor/sony/maple/proprietary/vendor/lib64/ || true
+
+    - name: Build Boot Image
+      working-directory: ./lineage
+      run: |
+        source build/envsetup.sh
+        # 注意：这里可能会有些许 Build Error，因为用 22 编 21 的树
+        # 但我们要的是 ALLOW_MISSING_DEPENDENCIES=true
+        export ALLOW_MISSING_DEPENDENCIES=true
+        export BUILD_BROKEN_MISSING_REQUIRED_MODULES=true
+        
+        lunch lineage_maple-userdebug
+        
+        # 只编译内核
+        mka bootimage
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: hybrid-boot-image-los22
+        path: lineage/out/target/product/maple/boot.img
