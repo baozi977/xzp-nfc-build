@@ -1,12 +1,12 @@
 name: Build XZP Hybrid Kernel (NFC Fixed)
 
 on:
-  workflow_dispatch: # 手动触发
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-20.04
-    
+
     steps:
     - name: Maximize Build Space (清理空间)
       uses: easimon/maximize-build-space@master
@@ -20,12 +20,17 @@ jobs:
     - name: Install Dependencies (安装编译工具)
       run: |
         sudo apt-get update
-        sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python3 python-is-python3
+        sudo apt-get install -y \
+          bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf \
+          imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool \
+          libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils \
+          lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev \
+          python3 python-is-python3
 
     - name: Install Repo Tool
       run: |
         mkdir -p ~/bin
-        curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+        curl -L https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
         chmod a+x ~/bin/repo
         echo "$HOME/bin" >> $GITHUB_PATH
         git config --global user.name "GitHub Action"
@@ -33,92 +38,137 @@ jobs:
 
     - name: Initialize Repo (关键：混合环境配置)
       run: |
-        mkdir lineage
+        set -e
+        mkdir -p lineage
         cd lineage
-        
-        # 1. 初始化 Android 15 (LOS 22) 环境
-        # 必须用 22.0，否则 Ramdisk 版本不对，刷进去会卡死
+
+        echo "== 1) Init LOS 22 env (Android 15) =="
         repo init -u https://github.com/LineageOS/android.git -b lineage-22.0 --depth=1
-        
-        # 2. 创建清单：强制使用 whatawurst 的 LOS 21 代码
+
+        echo "== 2) Write local manifest forcing LOS21 device/kernel repos =="
         mkdir -p .repo/local_manifests
-        cat <<EOF > .repo/local_manifests/roomservice.xml
+        cat > .repo/local_manifests/roomservice.xml <<'EOF'
         <?xml version="1.0" encoding="UTF-8"?>
         <manifest>
-            <project name="whatawurst/android_kernel_sony_msm8998" path="kernel/sony/msm8998" remote="github" revision="lineage-21" />
-            
-            <project name="whatawurst/android_device_sony_poplar_kddi" path="device/sony/poplar_kddi" remote="github" revision="lineage-21" />
-            
-            <project name="LineageOS/android_device_sony_maple" path="device/sony/maple" remote="github" revision="lineage-21" />
-            
-            <project name="whatawurst/android_vendor_sony_poplar_kddi" path="vendor/sony/poplar_kddi" remote="github" revision="lineage-21" />
-            
-            <project name="whatawurst/android_device_sony_yoshino-common" path="device/sony/yoshino-common" remote="github" revision="lineage-21" />
-            <project name="whatawurst/android_vendor_sony_yoshino-common" path="vendor/sony/yoshino-common" remote="github" revision="lineage-21" />
+            <!-- Make sure the remote exists -->
+            <remote name="github" fetch="https://github.com/" />
+
+            <!-- Kernel / device trees from LOS21 (legacy sony) -->
+            <project name="whatawurst/android_kernel_sony_msm8998"
+                     path="kernel/sony/msm8998"
+                     remote="github"
+                     revision="lineage-21" />
+
+            <project name="LineageOS/android_device_sony_maple"
+                     path="device/sony/maple"
+                     remote="github"
+                     revision="lineage-21" />
+
+            <project name="whatawurst/android_device_sony_yoshino-common"
+                     path="device/sony/yoshino-common"
+                     remote="github"
+                     revision="lineage-21" />
+
+            <!-- 你如果确实需要 poplar_kddi device tree（仅参考/比对），保留也行 -->
+            <project name="whatawurst/android_device_sony_poplar_kddi"
+                     path="device/sony/poplar_kddi"
+                     remote="github"
+                     revision="lineage-21" />
         </manifest>
         EOF
 
-    - name: Sync Source (同步代码)
-      working-directory: ./lineage
-      run: |
-        # 允许部分仓库同步失败 (防止版本不匹配导致的卡顿)
-        repo sync -c -j$(nproc) --force-sync --no-clone-bundle --no-tags || true
+        echo "== Local manifest content =="
+        cat .repo/local_manifests/roomservice.xml
 
-    - name: 🟢 Apply Code Adjustments (核心：调整代码！)
+    - name: Sync Source (同步代码，失败不吞)
       working-directory: ./lineage
       run: |
-        echo "=== 开始调整代码：复刻 poplar_kddi 的逻辑 ==="
-        
-        # 1. 调整内核配置：强制开启 Sony CXD224X 驱动
-        # 路径可能因版本略有不同，尝试两个常见位置
-        CONFIG_FILE="kernel/sony/msm8998/arch/arm64/configs/lineage_yoshino_defconfig"
-        
-        if [ -f "$CONFIG_FILE" ]; then
-            echo "找到配置文件: $CONFIG_FILE"
-            # 检查是否已有配置，没有则追加
-            if ! grep -q "CONFIG_SONY_CXD224X=y" "$CONFIG_FILE"; then
-                echo "" >> $CONFIG_FILE
-                echo "# 强制开启日版 NFC 驱动" >> $CONFIG_FILE
-                echo "CONFIG_SONY_CXD224X=y" >> $CONFIG_FILE
-                echo "CONFIG_NFC_PN553=y" >> $CONFIG_FILE
-                echo "已注入内核驱动开关！"
-            fi
-        else
-            echo "❌ 错误：找不到内核配置文件！无法修复 NFC！"
-            exit 1
+        set -e
+        echo "== repo sync (1st try) =="
+        repo sync -c -j"$(nproc)" --force-sync --no-clone-bundle --no-tags
+        echo "== repo sync done =="
+
+    - name: 🟢 Apply Code Adjustments (核心：调整 defconfig)
+      working-directory: ./lineage
+      run: |
+        set -euo pipefail
+
+        echo "=== 开始调整内核 defconfig ==="
+
+        # defconfig 常见候选路径（不同树可能略有变化）
+        CANDIDATES=(
+          "kernel/sony/msm8998/arch/arm64/configs/lineage_yoshino_defconfig"
+          "kernel/sony/msm8998/arch/arm64/configs/yoshino_defconfig"
+          "kernel/sony/msm8998/arch/arm64/configs/lineage_defconfig"
+        )
+
+        CONFIG_FILE=""
+        for f in "${CANDIDATES[@]}"; do
+          if [ -f "$f" ]; then
+            CONFIG_FILE="$f"
+            break
+          fi
+        done
+
+        if [ -z "$CONFIG_FILE" ]; then
+          echo "❌ 错误：找不到 defconfig 文件！下面列出 configs 目录："
+          ls -la kernel/sony/msm8998/arch/arm64/configs || true
+          exit 1
         fi
 
-        # 2. 调整驱动文件：从 poplar_kddi 偷文件给 maple
-        # 创建 maple 缺失的目录
-        mkdir -p vendor/sony/maple/proprietary/vendor/firmware
-        mkdir -p vendor/sony/maple/proprietary/vendor/bin/hw
-        mkdir -p vendor/sony/maple/proprietary/vendor/lib64
-        
-        echo "正在搬运驱动..."
-        # 强行覆盖
-        cp -v vendor/sony/poplar_kddi/proprietary/vendor/firmware/libpn553* vendor/sony/maple/proprietary/vendor/firmware/ || true
-        cp -v vendor/sony/poplar_kddi/proprietary/vendor/bin/hw/*sony* vendor/sony/maple/proprietary/vendor/bin/hw/ || true
-        cp -v vendor/sony/poplar_kddi/proprietary/vendor/lib64/libnfc-nci.conf vendor/sony/maple/proprietary/vendor/lib64/ || true
-        
-        echo "代码调整完毕！准备编译..."
+        echo "✅ 使用 defconfig: $CONFIG_FILE"
 
-    - name: Build Boot Image (编译内核)
+        set_kcfg() {
+          local key="$1" val="$2" file="$3"
+          if grep -qE "^${key}=" "$file"; then
+            sed -i "s/^${key}=.*/${key}=${val}/" "$file"
+          else
+            echo "${key}=${val}" >> "$file"
+          fi
+        }
+
+        echo "== 强制启用 Sony CXD224X =="
+        set_kcfg CONFIG_SONY_CXD224X y "$CONFIG_FILE"
+
+        echo "== 为避免冲突，先禁用 NXP PN553 =="
+        # （你之前写成 y 了，这里改为 n）
+        set_kcfg CONFIG_NFC_PN553 n "$CONFIG_FILE"
+
+        echo "== 修改结果（defconfig 片段）=="
+        grep -nE "CONFIG_SONY_CXD224X=|CONFIG_NFC_PN553=" "$CONFIG_FILE" || true
+
+    - name: Build Boot Image (编译 bootimage)
       working-directory: ./lineage
       run: |
+        set -euo pipefail
+
         source build/envsetup.sh
-        
-        # 关键变量：允许跨版本编译，忽略依赖缺失
+
+        # 允许跨版本编译/缺失依赖（你原本就这么做）
         export ALLOW_MISSING_DEPENDENCIES=true
         export BUILD_BROKEN_MISSING_REQUIRED_MODULES=true
         export BUILD_BROKEN_ELF_PREBUILT_PRODUCT_COPY_FILES=true
-        
-        # 选择 XZ Premium (maple) 目标
+
         lunch lineage_maple-userdebug
-        
-        # 只编译 bootimage (含内核 + Ramdisk)
+
+        # 编译 bootimage (内核 + ramdisk)
         mka bootimage
 
-    - name: Upload Artifact (上传结果)
+        echo "=== 编译完成：验证最终 kernel .config 是否真的生效 ==="
+        KCFG="out/target/product/maple/obj/KERNEL_OBJ/.config"
+        if [ -f "$KCFG" ]; then
+          echo "✅ 找到最终 .config: $KCFG"
+          grep -nE "CONFIG_SONY_CXD224X=|CONFIG_NFC_PN553=" "$KCFG" || true
+        else
+          echo "⚠️ 未找到 $KCFG（不同内核构建系统可能路径不同）"
+          echo "尝试搜索 .config："
+          find out -maxdepth 6 -name ".config" -type f | head -n 20 || true
+        fi
+
+        echo "=== boot.img 输出检查 ==="
+        ls -la out/target/product/maple/boot.img
+
+    - name: Upload Artifact (上传 boot.img)
       uses: actions/upload-artifact@v4
       with:
         name: fixed_boot_image_for_los22
