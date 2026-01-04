@@ -1,4 +1,4 @@
-name: build-kernel-and-repack-boot
+name: build-imagegz-only
 
 on:
   workflow_dispatch:
@@ -8,36 +8,19 @@ on:
         required: true
         default: "https://github.com/whatawurst/android_kernel_sony_msm8998.git"
       kernel_branch:
-        description: "Preferred kernel branch (will auto-fallback if not found)"
+        description: "Preferred kernel branch (auto-fallback if not found)"
         required: true
         default: "lineage-22.0"
       defconfig:
-        description: "Kernel defconfig name (optional; build_kernel.sh will auto-pick if missing/wrong)"
+        description: "Kernel defconfig (optional; build_kernel.sh auto-picks if missing/wrong)"
         required: true
         default: "lineage_yoshino_defconfig"
-      magisk_ver:
-        description: "Magisk version to extract magiskboot from"
-        required: true
-        default: "26.4"
 
 jobs:
   build:
     runs-on: ubuntu-22.04
     env:
       TZ: Asia/Tokyo
-
-      # ---- Boot header values (from your magiskboot -h output / unpack_bootimg print) ----
-      BOOT_HEADER_VERSION: "0"
-      BOOT_PAGESIZE: "4096"
-      BOOT_BASE: "0x00000000"
-      BOOT_KERNEL_OFFSET: "0x00008000"
-      BOOT_RAMDISK_OFFSET: "0x01000000"
-      BOOT_SECOND_OFFSET: "0x00000000"
-      BOOT_TAGS_OFFSET: "0x00000100"
-      BOOT_OS_VERSION: "15.0.0"
-      BOOT_OS_PATCH: "2024-11"
-      BOOT_NAME: ""
-      BOOT_CMDLINE: "ehci-hcd.park=3 lpm_levels.sleep_disabled=1 sched_enable_hmp=0 sched_enable_power_aware=1 service_locator.enable=1 swiotlb=2048 androidboot.configfs=true androidboot.usbcontroller=a800000.dwc3 loop.max_part=7 androidboot.hardware=maple"
 
     steps:
       - name: Checkout repo
@@ -51,40 +34,6 @@ jobs:
             bc bison build-essential ccache curl flex git libelf-dev libssl-dev \
             python3 unzip zlib1g-dev lz4 ca-certificates file \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
-
-      # ---- Install magiskboot for UNPACK only (from Magisk APK libmagiskboot.so) ----
-      - name: Install magiskboot (for unpack)
-        run: |
-          set -eux
-          MAGISK_VER="${{ inputs.magisk_ver }}"
-          URL="https://github.com/topjohnwu/Magisk/releases/download/v${MAGISK_VER}/Magisk-v${MAGISK_VER}.apk"
-
-          rm -rf magisk_unpack
-          mkdir -p magisk_unpack
-
-          curl -fL --retry 5 --retry-delay 2 -o magisk.apk "$URL"
-          unzip -q magisk.apk -d magisk_unpack
-
-          MB_SO="magisk_unpack/lib/x86_64/libmagiskboot.so"
-          if [ ! -f "$MB_SO" ]; then
-            echo "ERROR: $MB_SO not found. Listing:"
-            find magisk_unpack -maxdepth 4 -type f | head -n 200
-            exit 1
-          fi
-
-          chmod +x "$MB_SO"
-          sudo cp "$MB_SO" /usr/local/bin/magiskboot
-          sudo chmod +x /usr/local/bin/magiskboot
-          magiskboot --help | head -n 15 || true
-
-      # ---- Get AOSP mkbootimg.py (do NOT use Ubuntu unpack_bootimg) ----
-      - name: Fetch AOSP mkbootimg tools
-        run: |
-          set -eux
-          rm -rf aosp_mkbootimg
-          git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg aosp_mkbootimg
-          ls -lah aosp_mkbootimg
-          python3 aosp_mkbootimg/mkbootimg.py --help | head -n 20 || true
 
       # ---- Select kernel branch (auto fallback) ----
       - name: Select kernel branch (auto fallback)
@@ -114,43 +63,10 @@ jobs:
           echo "ERROR: No suitable branch found on $REPO"
           exit 1
 
-      # ---- Unpack base boot with magiskboot (works), save base dtb + ramdisk ----
-      - name: Unpack base boot (magiskboot)
-        run: |
-          set -eux
-          test -f boot.img
-          rm -rf unpack
-          mkdir -p unpack
-          cp boot.img unpack/boot-base.img
-          cd unpack
-
-          magiskboot unpack -h boot-base.img
-          magiskboot unpack boot-base.img
-
-          # Save original kernel_dtb
-          test -f kernel_dtb
-          cp kernel_dtb base_kernel_dtb
-
-          # Determine ramdisk output
-          # magiskboot typically outputs ramdisk.cpio (maybe already decompressed)
-          if [ -f ramdisk.cpio.gz ]; then
-            cp ramdisk.cpio.gz base_ramdisk.gz
-          elif [ -f ramdisk.cpio ]; then
-            # Boot expects gzip ramdisk (your header showed RAMDISK_FMT gzip), so gzip it
-            gzip -c ramdisk.cpio > base_ramdisk.gz
-          elif [ -f ramdisk.gz ]; then
-            cp ramdisk.gz base_ramdisk.gz
-          else
-            echo "ERROR: cannot find ramdisk output from magiskboot!"
-            ls -lah
-            exit 1
-          fi
-
-          ls -lah base_kernel_dtb base_ramdisk.gz
-
-      # ---- Build kernel (Image.gz) ----
-      - name: Build kernel (Image.gz)
+      - name: Build Image.gz
         env:
+          # 可选：如果你在仓库 Settings -> Secrets -> Actions 里设置了
+          # Name: KERNEL_GITHUB_TOKEN
           KERNEL_GITHUB_TOKEN: ${{ secrets.KERNEL_GITHUB_TOKEN }}
         run: |
           set -eux
@@ -161,41 +77,10 @@ jobs:
 
           test -f out/Image.gz
           ls -lah out/Image.gz
+          file out/Image.gz || true
 
-      # ---- Repack boot with AOSP mkbootimg.py (avoid magiskboot repack + avoid ubuntu unpack_bootimg) ----
-      - name: Repack boot (AOSP mkbootimg.py)
-        run: |
-          set -eux
-          test -f out/Image.gz
-          test -f unpack/base_ramdisk.gz
-          test -f unpack/base_kernel_dtb
-
-          python3 aosp_mkbootimg/mkbootimg.py \
-            --header_version "${BOOT_HEADER_VERSION}" \
-            --pagesize "${BOOT_PAGESIZE}" \
-            --base "${BOOT_BASE}" \
-            --kernel_offset "${BOOT_KERNEL_OFFSET}" \
-            --ramdisk_offset "${BOOT_RAMDISK_OFFSET}" \
-            --second_offset "${BOOT_SECOND_OFFSET}" \
-            --tags_offset "${BOOT_TAGS_OFFSET}" \
-            --kernel out/Image.gz \
-            --ramdisk unpack/base_ramdisk.gz \
-            --dtb unpack/base_kernel_dtb \
-            --cmdline "${BOOT_CMDLINE}" \
-            --os_version "${BOOT_OS_VERSION}" \
-            --os_patch_level "${BOOT_OS_PATCH}" \
-            --name "${BOOT_NAME}" \
-            --output boot-nfc.img
-
-          ls -lah boot-nfc.img
-          sha256sum boot-nfc.img | tee boot-nfc.img.sha256
-
-      - name: Upload artifact
+      - name: Upload Image.gz
         uses: actions/upload-artifact@v4
         with:
-          name: boot-nfc
-          path: |
-            boot-nfc.img
-            boot-nfc.img.sha256
-            unpack/base_kernel_dtb
-            unpack/base_ramdisk.gz
+          name: Image-gz
+          path: out/Image.gz
