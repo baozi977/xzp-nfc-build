@@ -3,18 +3,26 @@ name: build-kernel-and-repack-boot
 on:
   workflow_dispatch:
     inputs:
-      kernel_ref:
-        description: "Kernel ref (branch or tag). Example: lineage-22.0"
+      kernel_repo:
+        description: "Kernel git repo URL"
+        required: true
+        default: "https://github.com/LineageOS/android_kernel_sony_msm8998.git"
+      kernel_branch:
+        description: "Kernel branch"
         required: true
         default: "lineage-22.0"
       defconfig:
-        description: "Kernel defconfig"
+        description: "Kernel defconfig name"
         required: true
         default: "lineage_yoshino_defconfig"
       pagesize:
-        description: "boot pagesize (yours is 4096)"
+        description: "boot.img pagesize (your boot is 4096)"
         required: true
         default: "4096"
+      magisk_ver:
+        description: "Magisk version to extract magiskboot from"
+        required: true
+        default: "26.4"
 
 jobs:
   build:
@@ -23,17 +31,8 @@ jobs:
       TZ: Asia/Tokyo
 
     steps:
-      - name: Checkout this repo (boot.img + scripts)
+      - name: Checkout repo
         uses: actions/checkout@v4
-
-      # 关键：用 actions/checkout 把内核仓库拉到 kernel/，避免 git clone 认证提示
-      - name: Checkout kernel repo
-        uses: actions/checkout@v4
-        with:
-          repository: LineageOS/android_kernel_sony_msm8998
-          ref: ${{ inputs.kernel_ref }}
-          path: kernel
-          fetch-depth: 1
 
       - name: Install deps
         run: |
@@ -43,26 +42,39 @@ jobs:
             bc bison build-essential ccache curl flex git libelf-dev libssl-dev \
             python3 unzip zlib1g-dev lz4 ca-certificates file gcc
 
-      # --- Install magiskboot (Magisk 26.4: use libmagiskboot.so as executable) ---
+      # ---- Install magiskboot (Magisk 26.x: use libmagiskboot.so as executable) ----
       - name: Install magiskboot
         run: |
           set -eux
-          MAGISK_VER="26.4"
+          MAGISK_VER="${{ inputs.magisk_ver }}"
           URL="https://github.com/topjohnwu/Magisk/releases/download/v${MAGISK_VER}/Magisk-v${MAGISK_VER}.apk"
 
           rm -rf magisk_unpack
           mkdir -p magisk_unpack
+
           curl -fL --retry 5 --retry-delay 2 -o magisk.apk "$URL"
+          file magisk.apk
           unzip -q magisk.apk -d magisk_unpack
 
+          # GitHub runner is x86_64; Magisk APK provides lib/x86_64/libmagiskboot.so
           MB_SO="magisk_unpack/lib/x86_64/libmagiskboot.so"
-          test -f "$MB_SO"
+          if [ ! -f "$MB_SO" ]; then
+            echo "x86_64 lib not found, try search any libmagiskboot.so..."
+            MB_SO="$(find magisk_unpack -type f -name 'libmagiskboot.so' -print | head -n 1 || true)"
+          fi
+
+          if [ -z "$MB_SO" ] || [ ! -f "$MB_SO" ]; then
+            echo "ERROR: libmagiskboot.so not found. Listing:"
+            find magisk_unpack -maxdepth 4 -type f | head -n 200
+            exit 1
+          fi
+
           chmod +x "$MB_SO"
           sudo cp "$MB_SO" /usr/local/bin/magiskboot
           sudo chmod +x /usr/local/bin/magiskboot
-          magiskboot --help | head -n 10 || true
+          magiskboot --help | head -n 20 || true
 
-      # --- Build dtbTool (standalone C source, gcc build) ---
+      # ---- Build standalone Qualcomm dtbTool (C source, gcc build) ----
       - name: Build dtbTool
         run: |
           set -eux
@@ -71,56 +83,70 @@ jobs:
           sudo mv dtbTool /usr/local/bin/dtbTool
           /usr/local/bin/dtbTool --help || true
 
-      # --- Build kernel + dtbs (no cloning here anymore) ---
+      # ---- Kernel build (uses your build_kernel.sh). Token injected here. ----
       - name: Build kernel (Image.gz + dtbs)
+        env:
+          # Put your PAT in repo Settings -> Secrets -> Actions:
+          # Name: KERNEL_GITHUB_TOKEN
+          KERNEL_GITHUB_TOKEN: ${{ secrets.KERNEL_GITHUB_TOKEN }}
         run: |
           set -eux
           test -f boot.img
-          test -d kernel
+          test -f ./build_kernel.sh
           chmod +x ./build_kernel.sh
-          ./build_kernel.sh "${{ inputs.defconfig }}"
+
+          # build_kernel.sh must output:
+          #   out/Image.gz
+          #   out/dtb/*.dtb
+          ./build_kernel.sh "${{ inputs.kernel_repo }}" "${{ inputs.kernel_branch }}" "${{ inputs.defconfig }}"
 
           test -f out/Image.gz
           test -d out/dtb
           ls -lah out/Image.gz
           echo "DTB count: $(ls -1 out/dtb | wc -l)"
 
+      # ---- Pack kernel_dtb blob for boot header v0 (pagesize must match your boot: 4096) ----
       - name: Pack kernel_dtb (qcdt)
         run: |
           set -eux
           PAGESIZE="${{ inputs.pagesize }}"
-          # 先尝试带 -p（有 dtc 时更稳），失败再退回不带 -p
-          if [ -d "kernel/scripts/dtc" ]; then
-            DTC_PATH="kernel/scripts/dtc/"
-          else
-            DTC_PATH=""
-          fi
 
+          # Try common dtbTool arg formats (implementation differences)
           set +e
-          /usr/local/bin/dtbTool -o out/kernel_dtb -s "${PAGESIZE}" -p "${DTC_PATH}" out/dtb
+          /usr/local/bin/dtbTool -o out/kernel_dtb -s "${PAGESIZE}" out/dtb
           RC=$?
           set -e
 
           if [ $RC -ne 0 ]; then
-            /usr/local/bin/dtbTool -o out/kernel_dtb -s "${PAGESIZE}" out/dtb
+            echo "dtbTool simple mode failed, retry with -p scripts/dtc/ if present..."
+            if [ -d "kernel/scripts/dtc" ]; then
+              /usr/local/bin/dtbTool -o out/kernel_dtb -s "${PAGESIZE}" -p kernel/scripts/dtc/ out/dtb
+            else
+              echo "No kernel/scripts/dtc; cannot use -p mode."
+              exit 1
+            fi
           fi
 
           test -f out/kernel_dtb
           ls -lah out/kernel_dtb
 
+      # ---- Unpack base boot, replace kernel + kernel_dtb, repack ----
       - name: Repack boot.img with new kernel + dtb
         run: |
           set -eux
           cp boot.img boot-base.img
+
+          # Your boot: HEADER_VER 0 + separate kernel_dtb
           magiskboot unpack -h boot-base.img
           magiskboot unpack boot-base.img
 
-          # HEADER_VER 0 + kernel_dtb 分离 -> 两个都替换
+          # Replace both
           cp out/Image.gz kernel
           cp out/kernel_dtb kernel_dtb
 
           magiskboot repack boot-base.img
           mv new-boot.img boot-nfc.img
+
           ls -lah boot-nfc.img
           sha256sum boot-nfc.img | tee boot-nfc.img.sha256
 
