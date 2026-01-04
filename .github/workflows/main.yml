@@ -89,12 +89,22 @@ jobs:
         echo "== Local manifest content =="
         cat .repo/local_manifests/roomservice.xml
 
-    - name: Sync Source (同步代码，失败不吞)
+    - name: Sync Source (同步代码，带心跳输出)
       working-directory: ./lineage
       run: |
-        set -e
-        echo "== repo sync (1st try) =="
-        repo sync -c -j"$(nproc)" --force-sync --no-clone-bundle --no-tags
+        set -euo pipefail
+        echo "== repo sync start =="
+
+        # 后台跑 repo sync，前台每 30 秒输出一次心跳，避免 Actions 认为挂起/看起来卡住
+        ( repo sync -c -j"$(nproc)" --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune ) &
+        SYNC_PID=$!
+
+        while kill -0 "$SYNC_PID" 2>/dev/null; do
+          echo "[sync] still running... $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          sleep 30
+        done
+
+        wait "$SYNC_PID"
         echo "== repo sync done =="
 
     - name: 🟢 Apply Code Adjustments (核心：调整 defconfig)
