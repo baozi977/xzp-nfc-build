@@ -59,7 +59,7 @@ jobs:
         echo "STOCK_BOOT=$GITHUB_WORKSPACE/stock/boot.img" >> $GITHUB_ENV
         mkdir -p "$GITHUB_WORKSPACE/src"
 
-    - name: Debug: show repo tree + stock dir
+    - name: "Debug: show repo tree + stock dir"
       run: |
         set -e
         echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
