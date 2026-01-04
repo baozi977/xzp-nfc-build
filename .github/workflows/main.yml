@@ -36,9 +36,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential ccache curl flex git libelf-dev libssl-dev \
-            python3 unzip zlib1g-dev lz4 ca-certificates file
+            python3 unzip zlib1g-dev lz4 ca-certificates file gcc
 
-      # --- Install magiskboot (from libmagiskboot.so inside APK) ---
+      # --- Install magiskboot (Magisk 26.4: use libmagiskboot.so as executable) ---
       - name: Install magiskboot
         run: |
           set -eux
@@ -49,38 +49,28 @@ jobs:
           mkdir -p magisk_unpack
 
           curl -fL --retry 5 --retry-delay 2 -o magisk.apk "$URL"
-          file magisk.apk
           unzip -q magisk.apk -d magisk_unpack
 
-          echo "Searching libmagiskboot.so..."
-          # Prefer x86_64 on GitHub runner
-          MB_SO="$(find magisk_unpack/lib/x86_64 -type f -name 'libmagiskboot.so' -print | head -n 1 || true)"
-          if [ -z "$MB_SO" ]; then
-            # Fallback: any arch (shouldn't happen on runner, but keep robust)
-            MB_SO="$(find magisk_unpack -type f -name 'libmagiskboot.so' -print | head -n 1 || true)"
-          fi
-          if [ -z "$MB_SO" ]; then
-            echo "ERROR: libmagiskboot.so not found. Listing:"
+          MB_SO="magisk_unpack/lib/x86_64/libmagiskboot.so"
+          if [ ! -f "$MB_SO" ]; then
+            echo "ERROR: $MB_SO not found. Listing:"
             find magisk_unpack -maxdepth 4 -type f | head -n 200
             exit 1
           fi
 
-          # This .so is directly runnable; install as magiskboot
           chmod +x "$MB_SO"
           sudo cp "$MB_SO" /usr/local/bin/magiskboot
           sudo chmod +x /usr/local/bin/magiskboot
+          magiskboot --help | head -n 10 || true
 
-          magiskboot --help | head -n 20 || true
-
-      # --- Build dtbTool (Qualcomm qcdt dtb blob generator) ---
-      - name: Build dtbTool (libufdt)
+      # --- Build Qualcomm dtbTool (standalone C source, gcc build) ---
+      - name: Build dtbTool
         run: |
           set -eux
-          git clone --depth=1 https://android.googlesource.com/platform/system/libufdt
-          cd libufdt
-          make -j"$(nproc)"
-          sudo cp utils/src/dtbTool /usr/local/bin/dtbTool
-          dtbTool --help | head -n 10 || true
+          git clone --depth=1 https://github.com/rajatgupta1998/android_tools_system_dtbTool.git dtbtool_src
+          gcc dtbtool_src/source/dtbtool.c -o dtbTool
+          sudo mv dtbTool /usr/local/bin/dtbTool
+          /usr/local/bin/dtbTool --help || true
 
       # --- Build kernel + dtbs using your script ---
       - name: Build kernel (Image.gz + dtbs)
@@ -90,21 +80,37 @@ jobs:
           chmod +x ./build_kernel.sh
           ./build_kernel.sh "${{ inputs.kernel_repo }}" "${{ inputs.kernel_branch }}" "${{ inputs.defconfig }}"
 
-          # Expect outputs
           test -f out/Image.gz
           test -d out/dtb
-
-          echo "Image.gz:"
           ls -lah out/Image.gz
-          echo "DTB count:"
-          ls -1 out/dtb | wc -l
+          echo "DTB count: $(ls -1 out/dtb | wc -l)"
 
-      # --- Pack dtb blob to match your boot.img format (kernel_dtb section) ---
+      # --- Pack kernel_dtb (qcdt) ---
       - name: Pack kernel_dtb (qcdt)
         run: |
           set -eux
           PAGESIZE="${{ inputs.pagesize }}"
-          dtbTool -o out/kernel_dtb -s "${PAGESIZE}" out/dtb
+
+          # dtbTool usage differs across implementations. This one expects:
+          # dtbTool -o <out> -s <pagesize> -p <dtc_path> <dtb_dir>
+          # Some builds accept without -p; we try with -p first, then fallback.
+
+          if [ -d "kernel/scripts/dtc" ]; then
+            DTC_PATH="kernel/scripts/dtc/"
+          else
+            DTC_PATH=""
+          fi
+
+          set +e
+          /usr/local/bin/dtbTool -o out/kernel_dtb -s "${PAGESIZE}" -p "${DTC_PATH}" out/dtb
+          RC=$?
+          set -e
+
+          if [ $RC -ne 0 ]; then
+            echo "dtbTool with -p failed, retry without -p..."
+            /usr/local/bin/dtbTool -o out/kernel_dtb -s "${PAGESIZE}" out/dtb
+          fi
+
           test -f out/kernel_dtb
           ls -lah out/kernel_dtb
 
@@ -114,9 +120,7 @@ jobs:
           set -eux
           cp boot.img boot-base.img
 
-          # Show header info (yours is HEADER_VER 0)
           magiskboot unpack -h boot-base.img
-
           magiskboot unpack boot-base.img
 
           # Your boot is HEADER_VER 0 + separate kernel_dtb -> replace BOTH
