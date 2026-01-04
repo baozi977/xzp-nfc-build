@@ -1,9 +1,8 @@
-name: Build XZP Hybrid Kernel (NFC Fixed)
+name: Build XZP Hybrid Kernel (NFC Fixed - Minimal + /mnt)
 
 on:
   workflow_dispatch:
 
-# 可选：避免你连点 Run workflow 堆队列（只保留最新一次）
 concurrency:
   group: xzp-nfc-build
   cancel-in-progress: true
@@ -21,16 +20,25 @@ jobs:
         remove-dotnet: 'true'
         remove-android: 'true'
         remove-codeql: 'true'
+        remove-haskell: 'true'
+        remove-docker-images: 'true'
 
-    - name: Install Dependencies (安装编译工具)
+    - name: Show Disk (before)
+      run: |
+        set -e
+        df -h
+        echo "== largest dirs in / =="
+        sudo du -xhd1 / 2>/dev/null | sort -h | tail -n 20 || true
+
+    - name: Install Dependencies
       run: |
         set -e
         sudo apt-get update
         sudo apt-get install -y \
           bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf \
-          imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool \
-          libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils \
-          lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev \
+          lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool \
+          libncurses5 libncurses5-dev libssl-dev libxml2 libxml2-utils \
+          lzop rsync schedtool squashfs-tools xsltproc zip zlib1g-dev \
           python3 python-is-python3
 
     - name: Install Repo Tool
@@ -43,77 +51,99 @@ jobs:
         git config --global user.name "GitHub Action"
         git config --global user.email "action@github.com"
 
-    - name: Initialize Repo (关键：混合环境配置)
+    - name: Prepare workspace in /mnt (关键：用大盘)
       run: |
         set -e
-        mkdir -p lineage
-        cd lineage
+        sudo mkdir -p /mnt/lineage
+        sudo chown -R "$USER:$USER" /mnt/lineage
+        echo "WORKDIR=/mnt/lineage" >> $GITHUB_ENV
+        df -h /mnt || true
 
-        echo "== 1) Init LOS 22 env (Android 15) =="
-        repo init -u https://github.com/LineageOS/android.git -b lineage-22.0 --depth=1
+    - name: Init Repo (Minimal manifest, NOT full Lineage)
+      run: |
+        set -e
+        cd "$WORKDIR"
 
-        echo "== 2) Reset local manifests (avoid stale conflicts) =="
-        rm -rf .repo/local_manifests
-        mkdir -p .repo/local_manifests
-
-        echo "== 3) Write local manifest (use non-conflicting remote name: gh) =="
-        cat > .repo/local_manifests/roomservice.xml <<'EOF'
+        cat > minimal.xml <<'EOF'
         <?xml version="1.0" encoding="UTF-8"?>
         <manifest>
-            <!-- 重要：不要用 name="github"，Lineage 主 manifest 已经定义过，会冲突 -->
-            <remote name="gh" fetch="https://github.com/" />
+          <remote name="los" fetch="https://github.com/LineageOS/" />
+          <remote name="gh"  fetch="https://github.com/" />
+          <default remote="los" revision="lineage-22.0" />
 
-            <project name="whatawurst/android_kernel_sony_msm8998"
-                     path="kernel/sony/msm8998"
-                     remote="gh"
-                     revision="lineage-21" />
+          <!-- ✅ 只保留能跑 build/envsetup.sh + lunch + bootimage 的核心 -->
+          <project name="android_build" path="build" />
+          <project name="android_build_soong" path="build/soong" />
+          <project name="android_system_core" path="system/core" />
+          <project name="android_system_sepolicy" path="system/sepolicy" />
+          <project name="android_frameworks_base" path="frameworks/base" />
 
-            <project name="LineageOS/android_device_sony_maple"
-                     path="device/sony/maple"
-                     remote="gh"
-                     revision="lineage-21" />
+          <project name="android_prebuilts_build-tools" path="prebuilts/build-tools" />
+          <project name="android_prebuilts_clang_host_linux-x86" path="prebuilts/clang/host/linux-x86" />
+          <project name="android_prebuilts_tools" path="prebuilts/tools" />
 
-            <project name="whatawurst/android_device_sony_yoshino-common"
-                     path="device/sony/yoshino-common"
-                     remote="gh"
-                     revision="lineage-21" />
+          <project name="android_external_avb" path="external/avb" />
+          <project name="android_external_libcxx" path="external/libcxx" />
+          <project name="android_external_zlib" path="external/zlib" />
 
-            <!-- 可选：仅用于参考/对照 poplar -->
-            <project name="whatawurst/android_device_sony_poplar_kddi"
-                     path="device/sony/poplar_kddi"
-                     remote="gh"
-                     revision="lineage-21" />
+          <!-- ✅ 你的混合来源：LOS21 kernel + device + common -->
+          <project name="whatawurst/android_kernel_sony_msm8998"
+                   path="kernel/sony/msm8998"
+                   remote="gh"
+                   revision="lineage-21" />
+          <project name="LineageOS/android_device_sony_maple"
+                   path="device/sony/maple"
+                   remote="gh"
+                   revision="lineage-21" />
+          <project name="whatawurst/android_device_sony_yoshino-common"
+                   path="device/sony/yoshino-common"
+                   remote="gh"
+                   revision="lineage-21" />
         </manifest>
         EOF
 
-        echo "== Local manifest content =="
-        cat .repo/local_manifests/roomservice.xml
+        # ✅ 关键：init 的上游是本地 minimal.xml，不是 LineageOS/android.git 全量 manifest
+        repo init -u . -m minimal.xml \
+          --repo-url=https://github.com/LineageOS/android_tools_repo.git \
+          --repo-rev=stable \
+          --depth=1 \
+          --partial-clone \
+          --clone-filter=blob:none
 
-    - name: Sync Source (同步代码，带心跳输出)
-      working-directory: ./lineage
+        echo "== minimal.xml =="
+        cat minimal.xml
+
+    - name: Repo Sync (heartbeat + disk monitor)
       run: |
         set -euo pipefail
-        echo "== repo sync start =="
+        cd "$WORKDIR"
 
-        # 后台跑 repo sync，前台每 30 秒输出一次心跳，避免 Actions 认为挂起/看起来卡住
-        ( repo sync -c -j"$(nproc)" --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune ) &
+        echo "== repo sync start =="
+        ( repo sync -c -j4 --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune ) &
         SYNC_PID=$!
 
         while kill -0 "$SYNC_PID" 2>/dev/null; do
           echo "[sync] still running... $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          df -h | sed -n '1,8p'
           sleep 30
         done
 
         wait "$SYNC_PID"
         echo "== repo sync done =="
 
-    - name: 🟢 Apply Code Adjustments (核心：调整 defconfig)
-      working-directory: ./lineage
+    - name: Show Disk (after sync)
+      run: |
+        set -e
+        cd "$WORKDIR"
+        df -h
+        du -sh .repo || true
+        du -sh . || true
+
+    - name: Patch defconfig (enable CXD224X, disable PN553)
       run: |
         set -euo pipefail
-        echo "=== 开始调整内核 defconfig ==="
+        cd "$WORKDIR"
 
-        # defconfig 常见候选路径（不同树可能略有变化）
         CANDIDATES=(
           "kernel/sony/msm8998/arch/arm64/configs/lineage_yoshino_defconfig"
           "kernel/sony/msm8998/arch/arm64/configs/yoshino_defconfig"
@@ -122,19 +152,14 @@ jobs:
 
         CONFIG_FILE=""
         for f in "${CANDIDATES[@]}"; do
-          if [ -f "$f" ]; then
-            CONFIG_FILE="$f"
-            break
-          fi
+          if [ -f "$f" ]; then CONFIG_FILE="$f"; break; fi
         done
 
         if [ -z "$CONFIG_FILE" ]; then
-          echo "❌ 错误：找不到 defconfig 文件！下面列出 configs 目录："
+          echo "❌ defconfig not found"
           ls -la kernel/sony/msm8998/arch/arm64/configs || true
           exit 1
         fi
-
-        echo "✅ 使用 defconfig: $CONFIG_FILE"
 
         set_kcfg() {
           local key="$1" val="$2" file="$3"
@@ -145,23 +170,18 @@ jobs:
           fi
         }
 
-        echo "== 强制启用 Sony CXD224X =="
         set_kcfg CONFIG_SONY_CXD224X y "$CONFIG_FILE"
-
-        echo "== 为避免冲突，先禁用 NXP PN553 =="
         set_kcfg CONFIG_NFC_PN553 n "$CONFIG_FILE"
 
-        echo "== 修改结果（defconfig 片段）=="
+        echo "== defconfig result =="
         grep -nE "CONFIG_SONY_CXD224X=|CONFIG_NFC_PN553=" "$CONFIG_FILE" || true
 
-    - name: Build Boot Image (编译 bootimage)
-      working-directory: ./lineage
+    - name: Build Boot Image
       run: |
         set -euo pipefail
+        cd "$WORKDIR"
 
         source build/envsetup.sh
-
-        # 允许跨版本编译/缺失依赖
         export ALLOW_MISSING_DEPENDENCIES=true
         export BUILD_BROKEN_MISSING_REQUIRED_MODULES=true
         export BUILD_BROKEN_ELF_PREBUILT_PRODUCT_COPY_FILES=true
@@ -169,22 +189,10 @@ jobs:
         lunch lineage_maple-userdebug
         mka bootimage
 
-        echo "=== 编译完成：验证最终 kernel .config 是否真的生效 ==="
-        KCFG="out/target/product/maple/obj/KERNEL_OBJ/.config"
-        if [ -f "$KCFG" ]; then
-          echo "✅ 找到最终 .config: $KCFG"
-          grep -nE "CONFIG_SONY_CXD224X=|CONFIG_NFC_PN553=" "$KCFG" || true
-        else
-          echo "⚠️ 未找到 $KCFG（不同内核构建系统可能路径不同）"
-          echo "尝试搜索 .config："
-          find out -maxdepth 6 -name ".config" -type f | head -n 30 || true
-        fi
-
-        echo "=== boot.img 输出检查 ==="
         ls -la out/target/product/maple/boot.img
 
-    - name: Upload Artifact (上传 boot.img)
+    - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: fixed_boot_image_for_los22
-        path: lineage/out/target/product/maple/boot.img
+        path: /mnt/lineage/out/target/product/maple/boot.img
