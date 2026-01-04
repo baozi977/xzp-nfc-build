@@ -1,4 +1,4 @@
-name: Build XZP Hybrid Kernel (NFC Fixed - Minimal + WorkspaceDisk)
+name: Build XZP Hybrid Kernel (NFC Fixed - Minimal + AOSP prebuilts)
 
 on:
   workflow_dispatch:
@@ -53,16 +53,15 @@ jobs:
         git config --global user.email "action@github.com"
         echo "GIT_TERMINAL_PROMPT=0" >> $GITHUB_ENV
 
-    - name: Prepare workspace directory (用 /home/runner/work 的大盘)
+    - name: Prepare workspace directory (强制用大盘挂载点)
       run: |
         set -e
-        # 关键：不要用 /mnt（你机器上 /mnt 已经 100%）
         mkdir -p "$GITHUB_WORKSPACE/lineage"
         echo "WORKDIR=$GITHUB_WORKSPACE/lineage" >> $GITHUB_ENV
         echo "WORKDIR=$GITHUB_WORKSPACE/lineage"
         df -h "$GITHUB_WORKSPACE" || true
 
-    - name: Create local manifest git repo
+    - name: Create local manifest git repo (minimal.xml)
       run: |
         set -e
         cd "$WORKDIR"
@@ -72,27 +71,47 @@ jobs:
         cd manifest-repo
         git init -b main
 
+        # 关键改动：
+        # - LineageOS 的部分继续走 los remote + lineage-22.0（框架/构建系统）
+        # - AOSP 原生/预编译工具链（libcxx/zlib/clang/build-tools/tools）改走 aosp remote + main
         cat > minimal.xml <<'EOF'
         <?xml version="1.0" encoding="UTF-8"?>
         <manifest>
-          <remote name="los" fetch="https://github.com/LineageOS/" />
-          <remote name="gh"  fetch="https://github.com/" />
+          <remote name="los"  fetch="https://github.com/LineageOS/" />
+          <remote name="gh"   fetch="https://github.com/" />
+          <remote name="aosp" fetch="https://android.googlesource.com/" />
+
           <default remote="los" revision="lineage-22.0" />
 
-          <!-- ✅ 最小骨架：只够跑 envsetup/lunch/bootimage（缺啥后面再加） -->
+          <!-- ✅ LOS 22 构建骨架（有 lineage-22.0 分支的那部分） -->
           <project name="android_build" path="build" />
           <project name="android_build_soong" path="build/soong" />
           <project name="android_system_core" path="system/core" />
           <project name="android_system_sepolicy" path="system/sepolicy" />
           <project name="android_frameworks_base" path="frameworks/base" />
 
-          <project name="android_prebuilts_build-tools" path="prebuilts/build-tools" />
-          <project name="android_prebuilts_clang_host_linux-x86" path="prebuilts/clang/host/linux-x86" />
-          <project name="android_prebuilts_tools" path="prebuilts/tools" />
+          <!-- ✅ AOSP upstream：这些仓库经常没有 lineage-22.0 分支，改用 googlesource main -->
+          <project name="platform/external/libcxx"
+                   path="external/libcxx"
+                   remote="aosp"
+                   revision="main" />
+          <project name="platform/external/zlib"
+                   path="external/zlib"
+                   remote="aosp"
+                   revision="main" />
 
-          <project name="android_external_avb" path="external/avb" />
-          <project name="android_external_libcxx" path="external/libcxx" />
-          <project name="android_external_zlib" path="external/zlib" />
+          <project name="platform/prebuilts/build-tools"
+                   path="prebuilts/build-tools"
+                   remote="aosp"
+                   revision="main" />
+          <project name="platform/prebuilts/tools"
+                   path="prebuilts/tools"
+                   remote="aosp"
+                   revision="main" />
+          <project name="platform/prebuilts/clang/host/linux-x86"
+                   path="prebuilts/clang/host/linux-x86"
+                   remote="aosp"
+                   revision="main" />
 
           <!-- ✅ 你的混合来源：LOS21 kernel + device + common -->
           <project name="whatawurst/android_kernel_sony_msm8998"
@@ -125,23 +144,39 @@ jobs:
           --partial-clone \
           --clone-filter=blob:none
 
-    - name: Repo Sync (heartbeat + disk monitor)
+    - name: Repo Sync (retry + fail-fast + heartbeat)
       run: |
         set -euo pipefail
         cd "$WORKDIR"
 
-        echo "== repo sync start =="
-        ( repo sync -c -j4 --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune ) &
-        SYNC_PID=$!
+        # 先用 -j1 --fail-fast（官方也建议这样定位错误），成功后再并发 sync
+        sync_once () {
+          local jobs="$1"
+          echo "== repo sync (jobs=$jobs) start =="
+          repo sync -c -j"$jobs" --fail-fast --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune
+          echo "== repo sync (jobs=$jobs) done =="
+        }
 
-        while kill -0 "$SYNC_PID" 2>/dev/null; do
-          echo "[sync] still running... $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          df -h | sed -n '1,8p'
-          sleep 30
+        for attempt in 1 2 3; do
+          echo "== repo sync attempt $attempt/3 =="
+          (
+            sync_once 1
+          ) && break || {
+            echo "!! sync failed on attempt $attempt"
+            df -h | sed -n '1,12p' || true
+            # 清掉可能的半拉子项目锁/临时目录（保守处理）
+            rm -rf .repo/repo.tmp || true
+            sleep 20
+          }
+          if [ "$attempt" -eq 3 ]; then
+            echo "❌ repo sync failed after 3 attempts"
+            exit 1
+          fi
         done
 
-        wait "$SYNC_PID"
-        echo "== repo sync done =="
+        # 如果 j1 成功，再跑一次并发 sync 加速补齐（可选）
+        # 这里用较小并发，避免 IO/网络抖动
+        sync_once 4
 
     - name: Show Disk (after sync)
       run: |
@@ -194,7 +229,6 @@ jobs:
         cd "$WORKDIR"
 
         source build/envsetup.sh
-
         export ALLOW_MISSING_DEPENDENCIES=true
         export BUILD_BROKEN_MISSING_REQUIRED_MODULES=true
         export BUILD_BROKEN_ELF_PREBUILT_PRODUCT_COPY_FILES=true
