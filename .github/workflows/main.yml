@@ -6,13 +6,13 @@ on:
       kernel_repo:
         description: "Kernel git repo URL"
         required: true
-        default: "https://github.com/LineageOS/android_kernel_sony_msm8998.git"
+        default: "https://github.com/whatawurst/android_kernel_sony_msm8998.git"
       kernel_branch:
-        description: "Kernel branch"
+        description: "Preferred kernel branch (will auto-fallback if not found)"
         required: true
         default: "lineage-22.0"
       defconfig:
-        description: "Kernel defconfig name"
+        description: "Kernel defconfig name (will auto-fallback if not found)"
         required: true
         default: "lineage_yoshino_defconfig"
       pagesize:
@@ -53,16 +53,13 @@ jobs:
           mkdir -p magisk_unpack
 
           curl -fL --retry 5 --retry-delay 2 -o magisk.apk "$URL"
-          file magisk.apk
           unzip -q magisk.apk -d magisk_unpack
 
-          # GitHub runner is x86_64; Magisk APK provides lib/x86_64/libmagiskboot.so
           MB_SO="magisk_unpack/lib/x86_64/libmagiskboot.so"
           if [ ! -f "$MB_SO" ]; then
-            echo "x86_64 lib not found, try search any libmagiskboot.so..."
+            echo "x86_64 lib not found, search any libmagiskboot.so..."
             MB_SO="$(find magisk_unpack -type f -name 'libmagiskboot.so' -print | head -n 1 || true)"
           fi
-
           if [ -z "$MB_SO" ] || [ ! -f "$MB_SO" ]; then
             echo "ERROR: libmagiskboot.so not found. Listing:"
             find magisk_unpack -maxdepth 4 -type f | head -n 200
@@ -72,9 +69,9 @@ jobs:
           chmod +x "$MB_SO"
           sudo cp "$MB_SO" /usr/local/bin/magiskboot
           sudo chmod +x /usr/local/bin/magiskboot
-          magiskboot --help | head -n 20 || true
+          magiskboot --help | head -n 15 || true
 
-      # ---- Build standalone Qualcomm dtbTool (C source, gcc build) ----
+      # ---- Build standalone dtbTool (C source, gcc build) ----
       - name: Build dtbTool
         run: |
           set -eux
@@ -83,11 +80,43 @@ jobs:
           sudo mv dtbTool /usr/local/bin/dtbTool
           /usr/local/bin/dtbTool --help || true
 
-      # ---- Kernel build (uses your build_kernel.sh). Token injected here. ----
+      # ---- Detect available kernel branch (fallback) ----
+      - name: Select kernel branch (auto fallback)
+        id: pick_branch
+        run: |
+          set -eux
+          REPO="${{ inputs.kernel_repo }}"
+          PREFERRED="${{ inputs.kernel_branch }}"
+
+          echo "Checking heads from: $REPO"
+          git ls-remote --heads "$REPO" | head -n 30 || true
+
+          pick() {
+            b="$1"
+            if git ls-remote --heads "$REPO" "refs/heads/$b" | grep -q "refs/heads/$b"; then
+              echo "$b"
+              return 0
+            fi
+            return 1
+          }
+
+          # Try preferred first, then common fallbacks
+          for b in "$PREFERRED" lineage-22 lineage-21.0 lineage-21 lineage-20.0 lineage-20 lineage-19.1 lineage-19; do
+            if pick "$b" >/dev/null; then
+              echo "branch=$b" >> "$GITHUB_OUTPUT"
+              echo "Selected branch: $b"
+              exit 0
+            fi
+          done
+
+          echo "ERROR: No suitable branch found on $REPO"
+          exit 1
+
+      # ---- Build kernel (uses your build_kernel.sh) ----
       - name: Build kernel (Image.gz + dtbs)
         env:
-          # Put your PAT in repo Settings -> Secrets -> Actions:
-          # Name: KERNEL_GITHUB_TOKEN
+          # Optional: if you want to use token, set repo secret:
+          # KERNEL_GITHUB_TOKEN
           KERNEL_GITHUB_TOKEN: ${{ secrets.KERNEL_GITHUB_TOKEN }}
         run: |
           set -eux
@@ -95,30 +124,25 @@ jobs:
           test -f ./build_kernel.sh
           chmod +x ./build_kernel.sh
 
-          # build_kernel.sh must output:
-          #   out/Image.gz
-          #   out/dtb/*.dtb
-          ./build_kernel.sh "${{ inputs.kernel_repo }}" "${{ inputs.kernel_branch }}" "${{ inputs.defconfig }}"
+          ./build_kernel.sh "${{ inputs.kernel_repo }}" "${{ steps.pick_branch.outputs.branch }}" "${{ inputs.defconfig }}"
 
           test -f out/Image.gz
           test -d out/dtb
           ls -lah out/Image.gz
           echo "DTB count: $(ls -1 out/dtb | wc -l)"
 
-      # ---- Pack kernel_dtb blob for boot header v0 (pagesize must match your boot: 4096) ----
+      # ---- Pack kernel_dtb blob for boot header v0 ----
       - name: Pack kernel_dtb (qcdt)
         run: |
           set -eux
           PAGESIZE="${{ inputs.pagesize }}"
 
-          # Try common dtbTool arg formats (implementation differences)
           set +e
           /usr/local/bin/dtbTool -o out/kernel_dtb -s "${PAGESIZE}" out/dtb
           RC=$?
           set -e
-
           if [ $RC -ne 0 ]; then
-            echo "dtbTool simple mode failed, retry with -p scripts/dtc/ if present..."
+            echo "dtbTool simple mode failed, retry with -p kernel/scripts/dtc/ if present..."
             if [ -d "kernel/scripts/dtc" ]; then
               /usr/local/bin/dtbTool -o out/kernel_dtb -s "${PAGESIZE}" -p kernel/scripts/dtc/ out/dtb
             else
@@ -130,17 +154,16 @@ jobs:
           test -f out/kernel_dtb
           ls -lah out/kernel_dtb
 
-      # ---- Unpack base boot, replace kernel + kernel_dtb, repack ----
+      # ---- Repack base boot: replace kernel + kernel_dtb ----
       - name: Repack boot.img with new kernel + dtb
         run: |
           set -eux
           cp boot.img boot-base.img
 
-          # Your boot: HEADER_VER 0 + separate kernel_dtb
           magiskboot unpack -h boot-base.img
           magiskboot unpack boot-base.img
 
-          # Replace both
+          # HEADER_VER 0 + separate kernel_dtb -> replace BOTH
           cp out/Image.gz kernel
           cp out/kernel_dtb kernel_dtb
 
