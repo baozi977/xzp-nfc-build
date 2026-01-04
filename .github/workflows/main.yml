@@ -1,4 +1,4 @@
-name: Build XZP Kernel boot.img (use STOCK boot as template, CXD224X on)
+name: Build XZP Kernel boot.img (use repo stock boot template, CXD224X on)
 
 on:
   workflow_dispatch:
@@ -12,8 +12,12 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-    - name: Checkout repo (to get stock/boot.img)
+    # ✅ 关键：必须 checkout，且如果用 LFS 也要拉下来
+    - name: Checkout repo (with LFS)
       uses: actions/checkout@v4
+      with:
+        lfs: true
+        fetch-depth: 1
 
     - name: Maximize Build Space
       uses: easimon/maximize-build-space@master
@@ -25,11 +29,6 @@ jobs:
         remove-codeql: 'true'
         remove-haskell: 'true'
         remove-docker-images: 'true'
-
-    - name: Show Disk (before)
-      run: |
-        set -e
-        df -h
 
     - name: Install Dependencies
       run: |
@@ -53,22 +52,40 @@ jobs:
         git config --global user.email "action@github.com"
         echo "GIT_TERMINAL_PROMPT=0" >> $GITHUB_ENV
 
-    - name: Prepare workspace directory
+    - name: Prepare paths
       run: |
         set -e
-        mkdir -p "$GITHUB_WORKSPACE/src"
         echo "WORKDIR=$GITHUB_WORKSPACE/src" >> $GITHUB_ENV
         echo "STOCK_BOOT=$GITHUB_WORKSPACE/stock/boot.img" >> $GITHUB_ENV
-        ls -la "$GITHUB_WORKSPACE/stock" || true
+        mkdir -p "$GITHUB_WORKSPACE/src"
 
-    - name: Verify stock boot.img exists
+    - name: Debug: show repo tree + stock dir
+      run: |
+        set -e
+        echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+        ls -la
+        echo "== stock dir =="
+        ls -la stock || true
+        echo "== find boot.img =="
+        find . -maxdepth 3 -name "boot.img" -print -exec ls -lah {} \; || true
+
+    - name: Verify stock boot.img exists (and not empty)
       run: |
         set -e
         if [ ! -f "$STOCK_BOOT" ]; then
           echo "❌ Missing stock boot at: $STOCK_BOOT"
-          echo "Please commit it into your repo as stock/boot.img"
+          echo "Repo root listing:"
+          ls -la
+          echo "stock listing:"
+          ls -la stock || true
           exit 1
         fi
+        if [ ! -s "$STOCK_BOOT" ]; then
+          echo "❌ stock boot exists but is empty (size=0). If you used Git LFS, ensure checkout lfs:true."
+          ls -lah "$STOCK_BOOT"
+          exit 1
+        fi
+        echo "✅ stock boot.img:"
         ls -lah "$STOCK_BOOT"
 
     - name: Create minimal manifest repo (kernel + mkbootimg + prebuilt clang)
@@ -115,26 +132,24 @@ jobs:
           --depth=1 --partial-clone --clone-filter=blob:none
         repo sync -c -j1 --fail-fast --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune
 
-    - name: Extract stock boot params + ramdisk (Python, no external tools)
+    - name: Extract stock boot params + ramdisk
       run: |
         set -euo pipefail
         cd "$WORKDIR"
         python3 - <<'PY'
-        import os, struct, math
+        import os, struct
 
         boot = os.environ["STOCK_BOOT"]
         outdir = os.path.join(os.environ["WORKDIR"], "out")
         os.makedirs(outdir, exist_ok=True)
 
         with open(boot,"rb") as f:
-          hdr = f.read(1660)
-          f.seek(0)
           blob = f.read()
 
-        if hdr[:8] != b"ANDROID!":
-          raise SystemExit("Not an ANDROID! boot image")
+        if blob[:8] != b"ANDROID!":
+          raise SystemExit("Not an ANDROID! boot image (magic mismatch)")
 
-        # classic header layout
+        hdr = blob[:1660]
         (kernel_size,kernel_addr,ramdisk_size,ramdisk_addr,second_size,second_addr,
          tags_addr,page_size,dt_size,unused) = struct.unpack("<10I", hdr[8:48])
 
@@ -144,9 +159,7 @@ jobs:
 
         def align(x, a): return ((x + a - 1)//a)*a
 
-        # sections start after header, each aligned to page_size
         off = page_size
-        kernel = blob[off:off+kernel_size]
         off = align(off + kernel_size, page_size)
         ramdisk = blob[off:off+ramdisk_size]
 
@@ -154,7 +167,6 @@ jobs:
         with open(ramdisk_path,"wb") as w:
           w.write(ramdisk)
 
-        # export for later steps
         def hex8(x): return "0x%08x"%x
         env_path = os.path.join(outdir, "stock_boot.env")
         with open(env_path,"w") as e:
@@ -174,8 +186,6 @@ jobs:
         print("ramdisk:", ramdisk_path)
         PY
 
-        # load env into GITHUB_ENV (multiline-safe)
-        echo "== exporting env =="
         while IFS= read -r line; do
           key="${line%%=*}"
           val="${line#*=}"
@@ -188,12 +198,12 @@ jobs:
           fi
         done < "$WORKDIR/out/stock_boot.env"
 
-    - name: Patch defconfig (auto pick maple; enable CXD224X, disable PN553)
+    - name: Patch defconfig (enable CXD224X, disable PN553)
       run: |
         set -euo pipefail
         cd "$WORKDIR"
-
         CFG_DIR="kernel/sony/msm8998/arch/arm64/configs"
+
         CANDIDATES=(
           "$CFG_DIR/lineage-msm8998-yoshino-maple_defconfig"
           "$CFG_DIR/lineage-msm8998-yoshino-maple_dsds_defconfig"
@@ -229,11 +239,10 @@ jobs:
           echo "# CONFIG_NFC_PN553 is not set" >> "$CONFIG_FILE"
         fi
 
-        echo "== verify =="
         grep -nE "CONFIG_SONY_CXD224X=|CONFIG_NFC_PN553=|# CONFIG_NFC_PN553 is not set" "$CONFIG_FILE" || true
         echo "DEFCONFIG_BASENAME=$(basename "$CONFIG_FILE")" >> $GITHUB_ENV
 
-    - name: Build kernel (clang) -> Image.gz-dtb/Image.gz/Image
+    - name: Build kernel (clang)
       run: |
         set -euo pipefail
         cd "$WORKDIR/kernel/sony/msm8998"
@@ -250,24 +259,19 @@ jobs:
         mkdir -p "$OUT"
 
         make O="$OUT" ARCH=arm64 "$DEFCONFIG_BASENAME"
-
-        # try common targets
         make -j"$(nproc)" O="$OUT" ARCH=arm64 \
           CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
           OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
           Image.gz-dtb || true
-
         make -j"$(nproc)" O="$OUT" ARCH=arm64 \
           CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
           OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
           Image.gz || true
-
         make -j"$(nproc)" O="$OUT" ARCH=arm64 \
           CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
           OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
           Image || true
 
-        echo "== kernel artifacts =="
         ls -la "$OUT/arch/arm64/boot" || true
 
         KIMG=""
@@ -283,26 +287,15 @@ jobs:
           echo "❌ kernel Image not found"
           exit 1
         fi
-
         echo "KERNEL_IMAGE=$KIMG" >> $GITHUB_ENV
-        echo "✅ KERNEL_IMAGE=$KIMG"
 
-    - name: Repack boot.img (use stock ramdisk + stock params)
+    - name: Repack boot.img (stock ramdisk + stock params)
       run: |
         set -euo pipefail
         cd "$WORKDIR"
-
         MKBOOTIMG_PY="$WORKDIR/system/tools/mkbootimg/mkbootimg.py"
-        if [ ! -f "$MKBOOTIMG_PY" ]; then
-          echo "❌ mkbootimg.py not found"
-          exit 1
-        fi
-
         OUTBOOT="$WORKDIR/out/boot_new.img"
 
-        # Convert addr -> base/offset form (classic)
-        # For your stock boot: kernel_addr=0x8000, ramdisk_addr=0x01000000, tags_addr=0x100
-        # Most Sony classic uses base=0, offsets = addr values.
         python3 "$MKBOOTIMG_PY" \
           --kernel "$KERNEL_IMAGE" \
           --ramdisk "$STOCK_RAMDISK" \
@@ -314,7 +307,6 @@ jobs:
           --cmdline "$STOCK_CMDLINE" \
           -o "$OUTBOOT"
 
-        echo "== new boot =="
         ls -lah "$OUTBOOT"
 
     - name: Upload Artifact
