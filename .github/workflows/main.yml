@@ -1,4 +1,4 @@
-name: Build XZP Hybrid Kernel (NFC Fixed - Minimal + /mnt)
+name: Build XZP Hybrid Kernel (NFC Fixed - Minimal + WorkspaceDisk)
 
 on:
   workflow_dispatch:
@@ -26,6 +26,7 @@ jobs:
     - name: Show Disk (before)
       run: |
         set -e
+        echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
         df -h
         echo "== largest dirs in / =="
         sudo du -xhd1 / 2>/dev/null | sort -h | tail -n 20 || true
@@ -50,21 +51,26 @@ jobs:
         echo "$HOME/bin" >> $GITHUB_PATH
         git config --global user.name "GitHub Action"
         git config --global user.email "action@github.com"
-        # 关键：禁止 git 在 CI 里弹出用户名密码提示（避免 Username for 'https://github.com'）
         echo "GIT_TERMINAL_PROMPT=0" >> $GITHUB_ENV
 
-    - name: Prepare workspace in /mnt (关键：用大盘)
+    - name: Prepare workspace directory (用 /home/runner/work 的大盘)
       run: |
         set -e
-        sudo mkdir -p /mnt/lineage
-        sudo chown -R "$USER:$USER" /mnt/lineage
-        echo "WORKDIR=/mnt/lineage" >> $GITHUB_ENV
-        df -h /mnt || true
+        # 关键：不要用 /mnt（你机器上 /mnt 已经 100%）
+        mkdir -p "$GITHUB_WORKSPACE/lineage"
+        echo "WORKDIR=$GITHUB_WORKSPACE/lineage" >> $GITHUB_ENV
+        echo "WORKDIR=$GITHUB_WORKSPACE/lineage"
+        df -h "$GITHUB_WORKSPACE" || true
 
-    - name: Init Repo (Minimal manifest, NOT full Lineage)
+    - name: Create local manifest git repo
       run: |
         set -e
         cd "$WORKDIR"
+
+        rm -rf manifest-repo
+        mkdir -p manifest-repo
+        cd manifest-repo
+        git init -b main
 
         cat > minimal.xml <<'EOF'
         <?xml version="1.0" encoding="UTF-8"?>
@@ -73,7 +79,7 @@ jobs:
           <remote name="gh"  fetch="https://github.com/" />
           <default remote="los" revision="lineage-22.0" />
 
-          <!-- ✅ 只保留能跑 build/envsetup.sh + lunch + bootimage 的核心 -->
+          <!-- ✅ 最小骨架：只够跑 envsetup/lunch/bootimage（缺啥后面再加） -->
           <project name="android_build" path="build" />
           <project name="android_build_soong" path="build/soong" />
           <project name="android_system_core" path="system/core" />
@@ -104,14 +110,20 @@ jobs:
         </manifest>
         EOF
 
-        # ✅ 关键修复点：不要指定 --repo-url/--repo-rev（避免 stable 不存在导致认证/拉取失败）
-        repo init -u . -m minimal.xml \
-          --depth=1 \
-          --partial-clone \
-          --clone-filter=blob:none
+        git add minimal.xml
+        git commit -m "Add minimal manifest" >/dev/null
 
         echo "== minimal.xml =="
         cat minimal.xml
+
+    - name: Init Repo (Minimal)
+      run: |
+        set -e
+        cd "$WORKDIR"
+        repo init -u "$WORKDIR/manifest-repo" -b main -m minimal.xml \
+          --depth=1 \
+          --partial-clone \
+          --clone-filter=blob:none
 
     - name: Repo Sync (heartbeat + disk monitor)
       run: |
@@ -193,16 +205,8 @@ jobs:
         echo "== boot.img =="
         ls -la out/target/product/maple/boot.img
 
-        echo "== verify kernel config (.config) =="
-        KCFG="out/target/product/maple/obj/KERNEL_OBJ/.config"
-        if [ -f "$KCFG" ]; then
-          grep -nE "CONFIG_SONY_CXD224X=|CONFIG_NFC_PN553=" "$KCFG" || true
-        else
-          find out -maxdepth 6 -name ".config" -type f | head -n 30 || true
-        fi
-
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: fixed_boot_image_for_los22
-        path: /mnt/lineage/out/target/product/maple/boot.img
+        path: ${{ github.workspace }}/lineage/out/target/product/maple/boot.img
