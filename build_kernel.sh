@@ -3,7 +3,7 @@ set -euxo pipefail
 
 KERNEL_REPO="${1:-https://github.com/whatawurst/android_kernel_sony_msm8998.git}"
 KERNEL_BRANCH="${2:-lineage-21.0}"
-# 第三个参数仍然允许你传 defconfig；如果传的不存在，就自动探测
+# 允许传 defconfig；如果不存在则自动选
 DEFCONFIG_IN="${3:-}"
 
 ROOT="$(pwd)"
@@ -12,7 +12,7 @@ OUTROOT="${ROOT}/out"
 rm -rf "${OUTROOT}"
 mkdir -p "${OUTROOT}"
 
-# Optional token for GitHub clone
+# -------- GitHub token support (OPTIONAL) --------
 if [ -n "${KERNEL_GITHUB_TOKEN:-}" ]; then
   echo "Using GitHub token for kernel clone"
   AUTH_REPO="$(echo "${KERNEL_REPO}" | sed "s#https://github.com/#https://${KERNEL_GITHUB_TOKEN}@github.com/#")"
@@ -20,6 +20,7 @@ else
   AUTH_REPO="${KERNEL_REPO}"
 fi
 
+# Avoid interactive auth in CI
 export GIT_TERMINAL_PROMPT=0
 git config --global --unset-all http.https://github.com/.extraheader || true
 git config --global --unset-all http.extraheader || true
@@ -35,7 +36,6 @@ cd kernel
 CONFIG_DIR="arch/arm64/configs"
 
 pick_defconfig() {
-  # $1: candidate name
   local c="$1"
   if [ -n "$c" ] && [ -f "${CONFIG_DIR}/${c}" ]; then
     echo "$c"
@@ -45,7 +45,6 @@ pick_defconfig() {
 }
 
 auto_defconfig() {
-  # 优先顺序：yoshino / maple / sony / msm8998 / lineage / defconfig
   local found=""
   found="$(ls -1 "${CONFIG_DIR}" | grep -iE 'yoshino.*defconfig' | head -n 1 || true)"
   [ -n "$found" ] && { echo "$found"; return 0; }
@@ -62,7 +61,6 @@ auto_defconfig() {
   found="$(ls -1 "${CONFIG_DIR}" | grep -iE 'lineage.*defconfig' | head -n 1 || true)"
   [ -n "$found" ] && { echo "$found"; return 0; }
 
-  # 兜底：任何 defconfig
   found="$(ls -1 "${CONFIG_DIR}" | grep -iE 'defconfig$' | head -n 1 || true)"
   [ -n "$found" ] && { echo "$found"; return 0; }
 
@@ -74,15 +72,20 @@ if pick_defconfig "${DEFCONFIG_IN}"; then
   echo "Using provided defconfig: ${DEFCONFIG}"
 else
   echo "Provided defconfig missing or empty: '${DEFCONFIG_IN}'"
-  echo "Available configs (top 60):"
-  ls -1 "${CONFIG_DIR}" | head -n 60 || true
-
+  echo "Available configs (top 80):"
+  ls -1 "${CONFIG_DIR}" | head -n 80 || true
   DEFCONFIG="$(auto_defconfig)"
   echo "Auto-selected defconfig: ${DEFCONFIG}"
 fi
 
+# ---- Build ----
 make O=out "${DEFCONFIG}"
-make -j"$(nproc)" O=out Image.gz dtbs
+
+# IMPORTANT: provide both CROSS_COMPILE and CROSS_COMPILE_ARM32
+make -j"$(nproc)" O=out \
+  CROSS_COMPILE=aarch64-linux-gnu- \
+  CROSS_COMPILE_ARM32=arm-linux-gnueabihf- \
+  Image.gz dtbs
 
 cp -f out/arch/arm64/boot/Image.gz "${OUTROOT}/Image.gz"
 
