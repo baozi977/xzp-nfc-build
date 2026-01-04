@@ -15,10 +15,6 @@ on:
         description: "Kernel defconfig name (optional; build_kernel.sh will auto-pick if missing/wrong)"
         required: true
         default: "lineage_yoshino_defconfig"
-      magisk_ver:
-        description: "Magisk version to extract magiskboot from"
-        required: true
-        default: "26.4"
 
 jobs:
   build:
@@ -36,38 +32,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential ccache curl flex git libelf-dev libssl-dev \
-            python3 unzip zlib1g-dev lz4 ca-certificates file gcc \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+            python3 unzip zlib1g-dev lz4 ca-certificates file \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf \
+            android-tools-mkbootimg
 
-      # ---- Install magiskboot (Magisk 26.x: use libmagiskboot.so as executable) ----
-      - name: Install magiskboot
-        run: |
-          set -eux
-          MAGISK_VER="${{ inputs.magisk_ver }}"
-          URL="https://github.com/topjohnwu/Magisk/releases/download/v${MAGISK_VER}/Magisk-v${MAGISK_VER}.apk"
-
-          rm -rf magisk_unpack
-          mkdir -p magisk_unpack
-
-          curl -fL --retry 5 --retry-delay 2 -o magisk.apk "$URL"
-          unzip -q magisk.apk -d magisk_unpack
-
-          MB_SO="magisk_unpack/lib/x86_64/libmagiskboot.so"
-          if [ ! -f "$MB_SO" ]; then
-            echo "x86_64 lib not found, search any libmagiskboot.so..."
-            MB_SO="$(find magisk_unpack -type f -name 'libmagiskboot.so' -print | head -n 1 || true)"
-          fi
-
-          if [ -z "$MB_SO" ] || [ ! -f "$MB_SO" ]; then
-            echo "ERROR: libmagiskboot.so not found. Listing:"
-            find magisk_unpack -maxdepth 4 -type f | head -n 200
-            exit 1
-          fi
-
-          chmod +x "$MB_SO"
-          sudo cp "$MB_SO" /usr/local/bin/magiskboot
-          sudo chmod +x /usr/local/bin/magiskboot
-          magiskboot --help | head -n 15 || true
+          mkbootimg --help | head -n 10 || true
+          unpack_bootimg --help | head -n 10 || true
 
       # ---- Select kernel branch (auto fallback) ----
       - name: Select kernel branch (auto fallback)
@@ -97,59 +67,135 @@ jobs:
           echo "ERROR: No suitable branch found on $REPO"
           exit 1
 
-      # ---- Unpack base boot first & save its kernel_dtb ----
-      - name: Unpack base boot & save base kernel_dtb
+      # ---- Unpack base boot using unpack_bootimg ----
+      - name: Unpack base boot (cfg + ramdisk + dtb)
         run: |
           set -eux
           test -f boot.img
+
+          rm -rf unpack
+          mkdir -p unpack
           cp boot.img boot-base.img
 
-          # Print header info (yours is HEADER_VER 0)
-          magiskboot unpack -h boot-base.img
+          unpack_bootimg --boot_img boot-base.img --out unpack
 
-          # Unpack to get kernel / ramdisk / kernel_dtb
-          magiskboot unpack boot-base.img
+          echo "Unpacked files:"
+          ls -lah unpack
 
-          # Save original kernel_dtb for reuse
-          test -f kernel_dtb
-          cp kernel_dtb base_kernel_dtb
-          ls -lah base_kernel_dtb
+          # Save dtb (name differs by tool versions)
+          if [ -f unpack/dtb ]; then
+            cp unpack/dtb unpack/base_dtb
+          elif [ -f unpack/kernel_dtb ]; then
+            cp unpack/kernel_dtb unpack/base_dtb
+          else
+            echo "ERROR: no dtb found in unpack output!"
+            ls -lah unpack
+            exit 1
+          fi
 
-      # ---- Build kernel (Image.gz + dtbs) ----
-      - name: Build kernel (Image.gz + dtbs)
+          # Save ramdisk (name differs by tool versions)
+          if [ -f unpack/ramdisk ]; then
+            cp unpack/ramdisk unpack/base_ramdisk
+          elif [ -f unpack/ramdisk.gz ]; then
+            cp unpack/ramdisk.gz unpack/base_ramdisk
+          else
+            echo "ERROR: no ramdisk found in unpack output!"
+            ls -lah unpack
+            exit 1
+          fi
+
+          test -f unpack/bootimg.cfg
+          echo "---- bootimg.cfg ----"
+          cat unpack/bootimg.cfg
+          echo "---------------------"
+
+      # ---- Build kernel (Image.gz) ----
+      - name: Build kernel (Image.gz)
         env:
-          # Optional: add PAT in repo Settings -> Secrets -> Actions:
-          # Name: KERNEL_GITHUB_TOKEN
           KERNEL_GITHUB_TOKEN: ${{ secrets.KERNEL_GITHUB_TOKEN }}
         run: |
           set -eux
           test -f ./build_kernel.sh
           chmod +x ./build_kernel.sh
 
-          # build_kernel.sh must output:
-          #   out/Image.gz
-          #   out/dtb/   (not used now, but kept for future DT work)
           ./build_kernel.sh "${{ inputs.kernel_repo }}" "${{ steps.pick_branch.outputs.branch }}" "${{ inputs.defconfig }}"
 
           test -f out/Image.gz
           ls -lah out/Image.gz
 
-      # ---- Repack: replace kernel only, reuse base kernel_dtb ----
-      - name: Repack boot.img (replace kernel only, reuse base kernel_dtb)
+      # ---- Repack boot with mkbootimg (replace kernel only; reuse ramdisk + dtb) ----
+      - name: Repack boot (mkbootimg)
         run: |
           set -eux
 
-          # Replace kernel with newly built Image.gz
-          test -f out/Image.gz
-          cp out/Image.gz kernel
+          KERNEL_NEW="out/Image.gz"
+          RAMDISK="unpack/base_ramdisk"
+          DTB="unpack/base_dtb"
+          CFG="unpack/bootimg.cfg"
 
-          # Reuse original dtb blob (critical: avoids dtbTool parsing issues)
-          test -f base_kernel_dtb
-          cp base_kernel_dtb kernel_dtb
+          test -f "$KERNEL_NEW"
+          test -f "$RAMDISK"
+          test -f "$DTB"
+          test -f "$CFG"
 
-          # Repack based on original boot header/params
-          magiskboot repack boot-base.img
-          mv new-boot.img boot-nfc.img
+          get_cfg() {
+            local k="$1"
+            grep -E "^${k}=" "$CFG" | head -n 1 | cut -d= -f2-
+          }
+
+          PAGESIZE="$(get_cfg pagesize)"
+          BASE="$(get_cfg base)"
+          KERNEL_OFFSET="$(get_cfg kernel_offset)"
+          RAMDISK_OFFSET="$(get_cfg ramdisk_offset)"
+          SECOND_OFFSET="$(get_cfg second_offset)"
+          TAGS_OFFSET="$(get_cfg tags_offset)"
+          NAME="$(get_cfg name)"
+          CMDLINE="$(get_cfg cmdline)"
+          OS_VERSION="$(get_cfg os_version)"
+          OS_PATCH_LEVEL="$(get_cfg os_patch_level)"
+          HEADER_VERSION="$(get_cfg header_version)"
+
+          : "${HEADER_VERSION:=0}"
+          : "${PAGESIZE:=4096}"
+          : "${BASE:=0x00000000}"
+          : "${KERNEL_OFFSET:=0x00008000}"
+          : "${RAMDISK_OFFSET:=0x01000000}"
+          : "${SECOND_OFFSET:=0x00f00000}"
+          : "${TAGS_OFFSET:=0x00000100}"
+          : "${NAME:=}"
+          : "${CMDLINE:=}"
+          : "${OS_VERSION:=15.0.0}"
+          : "${OS_PATCH_LEVEL:=2024-11}"
+
+          echo "mkbootimg params:"
+          echo "  header_version=$HEADER_VERSION"
+          echo "  pagesize=$PAGESIZE"
+          echo "  base=$BASE"
+          echo "  kernel_offset=$KERNEL_OFFSET"
+          echo "  ramdisk_offset=$RAMDISK_OFFSET"
+          echo "  second_offset=$SECOND_OFFSET"
+          echo "  tags_offset=$TAGS_OFFSET"
+          echo "  os_version=$OS_VERSION"
+          echo "  os_patch_level=$OS_PATCH_LEVEL"
+          echo "  name=$NAME"
+          echo "  cmdline=$CMDLINE"
+
+          mkbootimg \
+            --header_version "$HEADER_VERSION" \
+            --pagesize "$PAGESIZE" \
+            --base "$BASE" \
+            --kernel_offset "$KERNEL_OFFSET" \
+            --ramdisk_offset "$RAMDISK_OFFSET" \
+            --second_offset "$SECOND_OFFSET" \
+            --tags_offset "$TAGS_OFFSET" \
+            --kernel "$KERNEL_NEW" \
+            --ramdisk "$RAMDISK" \
+            --dtb "$DTB" \
+            --cmdline "$CMDLINE" \
+            --os_version "$OS_VERSION" \
+            --os_patch_level "$OS_PATCH_LEVEL" \
+            --name "$NAME" \
+            -o boot-nfc.img
 
           ls -lah boot-nfc.img
           sha256sum boot-nfc.img | tee boot-nfc.img.sha256
@@ -161,3 +207,6 @@ jobs:
           path: |
             boot-nfc.img
             boot-nfc.img.sha256
+            unpack/bootimg.cfg
+            unpack/base_dtb
+            unpack/base_ramdisk
