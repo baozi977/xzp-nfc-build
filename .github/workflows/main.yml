@@ -71,9 +71,6 @@ jobs:
         cd manifest-repo
         git init -b main
 
-        # 关键改动：
-        # - LineageOS 的部分继续走 los remote + lineage-22.0（框架/构建系统）
-        # - AOSP 原生/预编译工具链（libcxx/zlib/clang/build-tools/tools）改走 aosp remote + main
         cat > minimal.xml <<'EOF'
         <?xml version="1.0" encoding="UTF-8"?>
         <manifest>
@@ -118,10 +115,13 @@ jobs:
                    path="kernel/sony/msm8998"
                    remote="gh"
                    revision="lineage-21" />
-          <project name="LineageOS/android_device_sony_maple"
+
+          <!-- ✅ 关键修复：maple 的 device tree 用 whatawurst 的仓库，不用 LineageOS 组织仓库 -->
+          <project name="whatawurst/android_device_sony_maple"
                    path="device/sony/maple"
                    remote="gh"
                    revision="lineage-21" />
+
           <project name="whatawurst/android_device_sony_yoshino-common"
                    path="device/sony/yoshino-common"
                    remote="gh"
@@ -144,39 +144,12 @@ jobs:
           --partial-clone \
           --clone-filter=blob:none
 
-    - name: Repo Sync (retry + fail-fast + heartbeat)
+    - name: Repo Sync (fail-fast)
       run: |
         set -euo pipefail
         cd "$WORKDIR"
-
-        # 先用 -j1 --fail-fast（官方也建议这样定位错误），成功后再并发 sync
-        sync_once () {
-          local jobs="$1"
-          echo "== repo sync (jobs=$jobs) start =="
-          repo sync -c -j"$jobs" --fail-fast --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune
-          echo "== repo sync (jobs=$jobs) done =="
-        }
-
-        for attempt in 1 2 3; do
-          echo "== repo sync attempt $attempt/3 =="
-          (
-            sync_once 1
-          ) && break || {
-            echo "!! sync failed on attempt $attempt"
-            df -h | sed -n '1,12p' || true
-            # 清掉可能的半拉子项目锁/临时目录（保守处理）
-            rm -rf .repo/repo.tmp || true
-            sleep 20
-          }
-          if [ "$attempt" -eq 3 ]; then
-            echo "❌ repo sync failed after 3 attempts"
-            exit 1
-          fi
-        done
-
-        # 如果 j1 成功，再跑一次并发 sync 加速补齐（可选）
-        # 这里用较小并发，避免 IO/网络抖动
-        sync_once 4
+        echo "== repo sync =="
+        repo sync -c -j1 --fail-fast --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune
 
     - name: Show Disk (after sync)
       run: |
