@@ -38,7 +38,7 @@ jobs:
             bc bison build-essential ccache curl flex git libelf-dev libssl-dev \
             python3 unzip zlib1g-dev lz4 ca-certificates file
 
-      # --- Install magiskboot (robust: auto-find binary in APK) ---
+      # --- Install magiskboot (from libmagiskboot.so inside APK) ---
       - name: Install magiskboot
         run: |
           set -eux
@@ -52,17 +52,25 @@ jobs:
           file magisk.apk
           unzip -q magisk.apk -d magisk_unpack
 
-          echo "Searching magiskboot..."
-          MB="$(find magisk_unpack -type f -name magiskboot -print | head -n 1 || true)"
-          if [ -z "$MB" ]; then
-            echo "ERROR: magiskboot not found inside APK. Listing:"
-            find magisk_unpack -maxdepth 4 -type f | head -n 300
+          echo "Searching libmagiskboot.so..."
+          # Prefer x86_64 on GitHub runner
+          MB_SO="$(find magisk_unpack/lib/x86_64 -type f -name 'libmagiskboot.so' -print | head -n 1 || true)"
+          if [ -z "$MB_SO" ]; then
+            # Fallback: any arch (shouldn't happen on runner, but keep robust)
+            MB_SO="$(find magisk_unpack -type f -name 'libmagiskboot.so' -print | head -n 1 || true)"
+          fi
+          if [ -z "$MB_SO" ]; then
+            echo "ERROR: libmagiskboot.so not found. Listing:"
+            find magisk_unpack -maxdepth 4 -type f | head -n 200
             exit 1
           fi
 
-          chmod +x "$MB"
-          sudo cp "$MB" /usr/local/bin/magiskboot
-          magiskboot --help | head -n 10 || true
+          # This .so is directly runnable; install as magiskboot
+          chmod +x "$MB_SO"
+          sudo cp "$MB_SO" /usr/local/bin/magiskboot
+          sudo chmod +x /usr/local/bin/magiskboot
+
+          magiskboot --help | head -n 20 || true
 
       # --- Build dtbTool (Qualcomm qcdt dtb blob generator) ---
       - name: Build dtbTool (libufdt)
@@ -96,7 +104,6 @@ jobs:
         run: |
           set -eux
           PAGESIZE="${{ inputs.pagesize }}"
-          # -s must match boot.img pagesize (your boot is 4096)
           dtbTool -o out/kernel_dtb -s "${PAGESIZE}" out/dtb
           test -f out/kernel_dtb
           ls -lah out/kernel_dtb
@@ -107,19 +114,18 @@ jobs:
           set -eux
           cp boot.img boot-base.img
 
-          # Print header info for traceability
+          # Show header info (yours is HEADER_VER 0)
           magiskboot unpack -h boot-base.img
 
           magiskboot unpack boot-base.img
 
-          # Your boot is HEADER_VER 0 and has separate kernel_dtb -> replace both
+          # Your boot is HEADER_VER 0 + separate kernel_dtb -> replace BOTH
           cp out/Image.gz kernel
           cp out/kernel_dtb kernel_dtb
 
           magiskboot repack boot-base.img
           mv new-boot.img boot-nfc.img
 
-          echo "Result:"
           ls -lah boot-nfc.img
           sha256sum boot-nfc.img | tee boot-nfc.img.sha256
 
