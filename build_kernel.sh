@@ -1,33 +1,32 @@
 #!/usr/bin/env bash
 set -euxo pipefail
 
-# 这里假设你的内核源码在 ./kernel
-KERNEL_DIR="$(pwd)/kernel"
-OUTDIR="$(pwd)/out"
-mkdir -p "$OUTDIR"
+# 你要的内核仓库/分支（先用 lineage-22.0；如果不存在再改 21.0）
+KERNEL_REPO="https://github.com/LineageOS/android_kernel_sony_msm8998.git"
+KERNEL_BRANCH="lineage-22.0"
 
-# 你需要自己确认 defconfig 名字（例如 lineage_yoshino_defconfig / maple_defconfig 等）
-DEFCONFIG="lineage_yoshino_defconfig"
+# 输出目录
+mkdir -p out
 
+# 拉内核源码
+rm -rf kernel
+git clone --depth=1 -b "${KERNEL_BRANCH}" "${KERNEL_REPO}" kernel
+
+# 编译
 export ARCH=arm64
 export SUBARCH=arm64
 
-# 工具链：你可以用 kernel 自带 clang 或者你 repo 里准备好的 clang
-# 这里给一个通用写法：使用系统 clang（如果你的内核要求特定 clang，请替换）
-export CC=clang || true
+cd kernel
 
-cd "$KERNEL_DIR"
+# 这里 defconfig 先用常见的 yoshino（之后我们再按你树里实际名字改）
+DEFCONFIG="lineage_yoshino_defconfig"
 
-make O=out "$DEFCONFIG"
+make O=out "${DEFCONFIG}"
 make -j"$(nproc)" O=out Image.gz dtbs
 
-# 拷贝输出给后续步骤用
-cp -f out/arch/arm64/boot/Image.gz "$OUTDIR/Image.gz"
+# 拷贝产物
+cp -f out/arch/arm64/boot/Image.gz ../out/Image.gz
 
-# dtb 输出目录因内核树而异，常见是 out/arch/arm64/boot/dts/qcom/
-DTB_SRC="out/arch/arm64/boot/dts"
-mkdir -p "$OUTDIR/dtb"
-find "$DTB_SRC" -name "*.dtb" -maxdepth 5 -print -exec cp -f {} "$OUTDIR/dtb/" \;
-
-# 可选：你也可以只拷 maple 相关 dtb（更干净）
-# find "$DTB_SRC" -name "*maple*.dtb" -exec cp -f {} "$OUTDIR/dtb/" \;
+# 收集 dtb（目录可能因内核树略有差异；先用通用抓法）
+mkdir -p ../out/dtb
+find out/arch/arm64/boot/dts -name "*.dtb" -maxdepth 6 -print -exec cp -f {} ../out/dtb/ \;
