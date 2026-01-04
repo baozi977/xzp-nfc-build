@@ -12,7 +12,7 @@ on:
         required: true
         default: "lineage-22.0"
       defconfig:
-        description: "Kernel defconfig name (will auto-fallback if not found)"
+        description: "Kernel defconfig name (optional; will auto-pick if missing)"
         required: true
         default: "lineage_yoshino_defconfig"
       pagesize:
@@ -40,7 +40,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential ccache curl flex git libelf-dev libssl-dev \
-            python3 unzip zlib1g-dev lz4 ca-certificates file gcc
+            python3 unzip zlib1g-dev lz4 ca-certificates file gcc \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
 
       # ---- Install magiskboot (Magisk 26.x: use libmagiskboot.so as executable) ----
       - name: Install magiskboot
@@ -55,11 +56,13 @@ jobs:
           curl -fL --retry 5 --retry-delay 2 -o magisk.apk "$URL"
           unzip -q magisk.apk -d magisk_unpack
 
+          # GitHub runner is x86_64; Magisk APK provides lib/x86_64/libmagiskboot.so
           MB_SO="magisk_unpack/lib/x86_64/libmagiskboot.so"
           if [ ! -f "$MB_SO" ]; then
             echo "x86_64 lib not found, search any libmagiskboot.so..."
             MB_SO="$(find magisk_unpack -type f -name 'libmagiskboot.so' -print | head -n 1 || true)"
           fi
+
           if [ -z "$MB_SO" ] || [ ! -f "$MB_SO" ]; then
             echo "ERROR: libmagiskboot.so not found. Listing:"
             find magisk_unpack -maxdepth 4 -type f | head -n 200
@@ -88,9 +91,6 @@ jobs:
           REPO="${{ inputs.kernel_repo }}"
           PREFERRED="${{ inputs.kernel_branch }}"
 
-          echo "Checking heads from: $REPO"
-          git ls-remote --heads "$REPO" | head -n 30 || true
-
           pick() {
             b="$1"
             if git ls-remote --heads "$REPO" "refs/heads/$b" | grep -q "refs/heads/$b"; then
@@ -100,7 +100,6 @@ jobs:
             return 1
           }
 
-          # Try preferred first, then common fallbacks
           for b in "$PREFERRED" lineage-22 lineage-21.0 lineage-21 lineage-20.0 lineage-20 lineage-19.1 lineage-19; do
             if pick "$b" >/dev/null; then
               echo "branch=$b" >> "$GITHUB_OUTPUT"
@@ -112,11 +111,11 @@ jobs:
           echo "ERROR: No suitable branch found on $REPO"
           exit 1
 
-      # ---- Build kernel (uses your build_kernel.sh) ----
+      # ---- Kernel build (uses your build_kernel.sh). Token injected here. ----
       - name: Build kernel (Image.gz + dtbs)
         env:
-          # Optional: if you want to use token, set repo secret:
-          # KERNEL_GITHUB_TOKEN
+          # Put your PAT in repo Settings -> Secrets -> Actions:
+          # Name: KERNEL_GITHUB_TOKEN
           KERNEL_GITHUB_TOKEN: ${{ secrets.KERNEL_GITHUB_TOKEN }}
         run: |
           set -eux
@@ -141,6 +140,7 @@ jobs:
           /usr/local/bin/dtbTool -o out/kernel_dtb -s "${PAGESIZE}" out/dtb
           RC=$?
           set -e
+
           if [ $RC -ne 0 ]; then
             echo "dtbTool simple mode failed, retry with -p kernel/scripts/dtc/ if present..."
             if [ -d "kernel/scripts/dtc" ]; then
