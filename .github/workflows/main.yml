@@ -1,316 +1,72 @@
-name: Build XZP Kernel boot.img (use repo stock boot template, CXD224X on)
+name: build-and-repack-boot
 
 on:
   workflow_dispatch:
 
-concurrency:
-  group: xzp-nfc-build
-  cancel-in-progress: true
-
 jobs:
   build:
     runs-on: ubuntu-22.04
-
     steps:
-    # ✅ 关键：必须 checkout，且如果用 LFS 也要拉下来
-    - name: Checkout repo (with LFS)
-      uses: actions/checkout@v4
-      with:
-        lfs: true
-        fetch-depth: 1
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Maximize Build Space
-      uses: easimon/maximize-build-space@master
-      with:
-        root-reserve-mb: 2048
-        swap-size-mb: 10240
-        remove-dotnet: 'true'
-        remove-android: 'true'
-        remove-codeql: 'true'
-        remove-haskell: 'true'
-        remove-docker-images: 'true'
+      - name: Install deps
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex git libelf-dev libssl-dev \
+            python3 unzip zlib1g-dev lz4
 
-    - name: Install Dependencies
-      run: |
-        set -e
-        sudo apt-get update
-        sudo apt-get install -y \
-          bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf \
-          lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool \
-          libncurses5 libncurses5-dev libssl-dev libxml2 libxml2-utils \
-          lzop rsync schedtool squashfs-tools xsltproc zip zlib1g-dev \
-          python3 python-is-python3
+      - name: Install magiskboot
+        run: |
+          set -eux
+          curl -L -o magisk.apk https://github.com/topjohnwu/Magisk/releases/latest/download/Magisk-v26.4.apk
+          unzip -q magisk.apk
+          chmod +x lib/x86_64/magiskboot
+          sudo mv lib/x86_64/magiskboot /usr/local/bin/magiskboot
 
-    - name: Install Repo Tool
-      run: |
-        set -e
-        mkdir -p ~/bin
-        curl -L https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
-        chmod a+x ~/bin/repo
-        echo "$HOME/bin" >> $GITHUB_PATH
-        git config --global user.name "GitHub Action"
-        git config --global user.email "action@github.com"
-        echo "GIT_TERMINAL_PROMPT=0" >> $GITHUB_ENV
+      - name: Build dtbTool (libufdt)
+        run: |
+          set -eux
+          git clone --depth=1 https://android.googlesource.com/platform/system/libufdt
+          cd libufdt
+          make -j"$(nproc)"
+          sudo cp utils/src/dtbTool /usr/local/bin/dtbTool
 
-    - name: Prepare paths
-      run: |
-        set -e
-        echo "WORKDIR=$GITHUB_WORKSPACE/src" >> $GITHUB_ENV
-        echo "STOCK_BOOT=$GITHUB_WORKSPACE/stock/boot.img" >> $GITHUB_ENV
-        mkdir -p "$GITHUB_WORKSPACE/src"
+      - name: Build kernel (Image.gz + dtb)
+        run: |
+          set -eux
+          chmod +x ./build_kernel.sh
+          ./build_kernel.sh
+          test -f out/Image.gz
+          test -d out/dtb
 
-    - name: "Debug: show repo tree + stock dir"
-      run: |
-        set -e
-        echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
-        ls -la
-        echo "== stock dir =="
-        ls -la stock || true
-        echo "== find boot.img =="
-        find . -maxdepth 3 -name "boot.img" -print -exec ls -lah {} \; || true
+      - name: Pack kernel_dtb (pagesize 4096)
+        run: |
+          set -eux
+          dtbTool -o out/kernel_dtb -s 4096 out/dtb
+          test -f out/kernel_dtb
+          ls -lah out/kernel_dtb
 
-    - name: Verify stock boot.img exists (and not empty)
-      run: |
-        set -e
-        if [ ! -f "$STOCK_BOOT" ]; then
-          echo "❌ Missing stock boot at: $STOCK_BOOT"
-          echo "Repo root listing:"
-          ls -la
-          echo "stock listing:"
-          ls -la stock || true
-          exit 1
-        fi
-        if [ ! -s "$STOCK_BOOT" ]; then
-          echo "❌ stock boot exists but is empty (size=0). If you used Git LFS, ensure checkout lfs:true."
-          ls -lah "$STOCK_BOOT"
-          exit 1
-        fi
-        echo "✅ stock boot.img:"
-        ls -lah "$STOCK_BOOT"
+      - name: Repack boot.img with new kernel + dtb
+        run: |
+          set -eux
+          test -f boot.img
+          cp boot.img boot-base.img
 
-    - name: Create minimal manifest repo (kernel + mkbootimg + prebuilt clang)
-      run: |
-        set -e
-        cd "$WORKDIR"
-        rm -rf manifest-repo
-        mkdir -p manifest-repo
-        cd manifest-repo
-        git init -b main
+          magiskboot unpack boot-base.img
 
-        cat > minimal.xml <<'EOF'
-        <?xml version="1.0" encoding="UTF-8"?>
-        <manifest>
-          <remote name="gh"   fetch="https://github.com/" />
-          <remote name="aosp" fetch="https://android.googlesource.com/" />
-          <default remote="gh" revision="main" />
+          # 你的是 boot header v0 + kernel_dtb 分离结构：两个都替换
+          cp out/Image.gz kernel
+          cp out/kernel_dtb kernel_dtb
 
-          <project name="whatawurst/android_kernel_sony_msm8998"
-                   path="kernel/sony/msm8998"
-                   remote="gh"
-                   revision="lineage-21" />
+          magiskboot repack boot-base.img
+          mv new-boot.img boot-nfc.img
+          ls -lah boot-nfc.img
 
-          <project name="platform/system/tools/mkbootimg"
-                   path="system/tools/mkbootimg"
-                   remote="aosp"
-                   revision="main" />
-
-          <project name="platform/prebuilts/clang/host/linux-x86"
-                   path="prebuilts/clang/host/linux-x86"
-                   remote="aosp"
-                   revision="main" />
-        </manifest>
-        EOF
-
-        git add minimal.xml
-        git commit -m "kernel-only manifest" >/dev/null
-
-    - name: Init + Sync (kernel-only)
-      run: |
-        set -euo pipefail
-        cd "$WORKDIR"
-        repo init -u "$WORKDIR/manifest-repo" -b main -m minimal.xml \
-          --depth=1 --partial-clone --clone-filter=blob:none
-        repo sync -c -j1 --fail-fast --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune
-
-    - name: Extract stock boot params + ramdisk
-      run: |
-        set -euo pipefail
-        cd "$WORKDIR"
-        python3 - <<'PY'
-        import os, struct
-
-        boot = os.environ["STOCK_BOOT"]
-        outdir = os.path.join(os.environ["WORKDIR"], "out")
-        os.makedirs(outdir, exist_ok=True)
-
-        with open(boot,"rb") as f:
-          blob = f.read()
-
-        if blob[:8] != b"ANDROID!":
-          raise SystemExit("Not an ANDROID! boot image (magic mismatch)")
-
-        hdr = blob[:1660]
-        (kernel_size,kernel_addr,ramdisk_size,ramdisk_addr,second_size,second_addr,
-         tags_addr,page_size,dt_size,unused) = struct.unpack("<10I", hdr[8:48])
-
-        cmdline = hdr[64:64+512].split(b"\0",1)[0].decode("ascii","ignore")
-        extra = hdr[608:608+1024].split(b"\0",1)[0].decode("ascii","ignore")
-        full_cmdline = (cmdline + " " + extra).strip()
-
-        def align(x, a): return ((x + a - 1)//a)*a
-
-        off = page_size
-        off = align(off + kernel_size, page_size)
-        ramdisk = blob[off:off+ramdisk_size]
-
-        ramdisk_path = os.path.join(outdir, "stock_ramdisk.cpio.gz")
-        with open(ramdisk_path,"wb") as w:
-          w.write(ramdisk)
-
-        def hex8(x): return "0x%08x"%x
-        env_path = os.path.join(outdir, "stock_boot.env")
-        with open(env_path,"w") as e:
-          e.write(f"STOCK_PAGE_SIZE={page_size}\n")
-          e.write(f"STOCK_KERNEL_ADDR={hex8(kernel_addr)}\n")
-          e.write(f"STOCK_RAMDISK_ADDR={hex8(ramdisk_addr)}\n")
-          e.write(f"STOCK_TAGS_ADDR={hex8(tags_addr)}\n")
-          e.write(f"STOCK_CMDLINE={full_cmdline}\n")
-          e.write(f"STOCK_RAMDISK={ramdisk_path}\n")
-
-        print("== STOCK BOOT PARAMS ==")
-        print("page_size:", page_size)
-        print("kernel_addr:", hex8(kernel_addr))
-        print("ramdisk_addr:", hex8(ramdisk_addr))
-        print("tags_addr:", hex8(tags_addr))
-        print("cmdline:", full_cmdline)
-        print("ramdisk:", ramdisk_path)
-        PY
-
-        while IFS= read -r line; do
-          key="${line%%=*}"
-          val="${line#*=}"
-          if [ "$key" = "STOCK_CMDLINE" ]; then
-            echo "STOCK_CMDLINE<<EOF" >> $GITHUB_ENV
-            echo "$val" >> $GITHUB_ENV
-            echo "EOF" >> $GITHUB_ENV
-          else
-            echo "$line" >> $GITHUB_ENV
-          fi
-        done < "$WORKDIR/out/stock_boot.env"
-
-    - name: Patch defconfig (enable CXD224X, disable PN553)
-      run: |
-        set -euo pipefail
-        cd "$WORKDIR"
-        CFG_DIR="kernel/sony/msm8998/arch/arm64/configs"
-
-        CANDIDATES=(
-          "$CFG_DIR/lineage-msm8998-yoshino-maple_defconfig"
-          "$CFG_DIR/lineage-msm8998-yoshino-maple_dsds_defconfig"
-          "$CFG_DIR/lineage-msm8998-yoshino-poplar_kddi_defconfig"
-          "$CFG_DIR/defconfig"
-        )
-
-        CONFIG_FILE=""
-        for f in "${CANDIDATES[@]}"; do
-          if [ -f "$f" ]; then CONFIG_FILE="$f"; break; fi
-        done
-
-        if [ -z "$CONFIG_FILE" ]; then
-          echo "❌ defconfig not found"
-          ls -la "$CFG_DIR"
-          exit 1
-        fi
-
-        echo "✅ Using defconfig: $CONFIG_FILE"
-
-        set_kcfg() {
-          local key="$1" val="$2" file="$3"
-          if grep -qE "^${key}=" "$file"; then
-            sed -i "s/^${key}=.*/${key}=${val}/" "$file"
-          else
-            echo "${key}=${val}" >> "$file"
-          fi
-        }
-
-        set_kcfg CONFIG_SONY_CXD224X y "$CONFIG_FILE"
-        set_kcfg CONFIG_NFC_PN553 n "$CONFIG_FILE"
-        if ! grep -qE "^# CONFIG_NFC_PN553 is not set" "$CONFIG_FILE"; then
-          echo "# CONFIG_NFC_PN553 is not set" >> "$CONFIG_FILE"
-        fi
-
-        grep -nE "CONFIG_SONY_CXD224X=|CONFIG_NFC_PN553=|# CONFIG_NFC_PN553 is not set" "$CONFIG_FILE" || true
-        echo "DEFCONFIG_BASENAME=$(basename "$CONFIG_FILE")" >> $GITHUB_ENV
-
-    - name: Build kernel (clang)
-      run: |
-        set -euo pipefail
-        cd "$WORKDIR/kernel/sony/msm8998"
-
-        CLANG_DIR="$WORKDIR/prebuilts/clang/host/linux-x86"
-        CLANG_BIN="$(find "$CLANG_DIR" -type f -path "*/bin/clang" | head -n 1 || true)"
-        if [ -z "$CLANG_BIN" ]; then
-          echo "❌ clang not found under $CLANG_DIR"
-          exit 1
-        fi
-        export PATH="$(dirname "$CLANG_BIN"):$PATH"
-
-        OUT="$WORKDIR/out/kernel"
-        mkdir -p "$OUT"
-
-        make O="$OUT" ARCH=arm64 "$DEFCONFIG_BASENAME"
-        make -j"$(nproc)" O="$OUT" ARCH=arm64 \
-          CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
-          OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-          Image.gz-dtb || true
-        make -j"$(nproc)" O="$OUT" ARCH=arm64 \
-          CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
-          OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-          Image.gz || true
-        make -j"$(nproc)" O="$OUT" ARCH=arm64 \
-          CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
-          OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-          Image || true
-
-        ls -la "$OUT/arch/arm64/boot" || true
-
-        KIMG=""
-        if [ -f "$OUT/arch/arm64/boot/Image.gz-dtb" ]; then
-          KIMG="$OUT/arch/arm64/boot/Image.gz-dtb"
-        elif [ -f "$OUT/arch/arm64/boot/Image.gz" ]; then
-          KIMG="$OUT/arch/arm64/boot/Image.gz"
-        elif [ -f "$OUT/arch/arm64/boot/Image" ]; then
-          KIMG="$OUT/arch/arm64/boot/Image"
-        fi
-
-        if [ -z "$KIMG" ]; then
-          echo "❌ kernel Image not found"
-          exit 1
-        fi
-        echo "KERNEL_IMAGE=$KIMG" >> $GITHUB_ENV
-
-    - name: Repack boot.img (stock ramdisk + stock params)
-      run: |
-        set -euo pipefail
-        cd "$WORKDIR"
-        MKBOOTIMG_PY="$WORKDIR/system/tools/mkbootimg/mkbootimg.py"
-        OUTBOOT="$WORKDIR/out/boot_new.img"
-
-        python3 "$MKBOOTIMG_PY" \
-          --kernel "$KERNEL_IMAGE" \
-          --ramdisk "$STOCK_RAMDISK" \
-          --pagesize "$STOCK_PAGE_SIZE" \
-          --base 0x00000000 \
-          --kernel_offset "$STOCK_KERNEL_ADDR" \
-          --ramdisk_offset "$STOCK_RAMDISK_ADDR" \
-          --tags_offset "$STOCK_TAGS_ADDR" \
-          --cmdline "$STOCK_CMDLINE" \
-          -o "$OUTBOOT"
-
-        ls -lah "$OUTBOOT"
-
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: boot_img_kernel_repacked_cxd224x
-        path: ${{ github.workspace }}/src/out/boot_new.img
+      - name: Upload boot
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-nfc
+          path: boot-nfc.img
