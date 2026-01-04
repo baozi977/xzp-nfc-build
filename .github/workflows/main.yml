@@ -3,6 +3,11 @@ name: Build XZP Hybrid Kernel (NFC Fixed)
 on:
   workflow_dispatch:
 
+# 可选：避免你连点 Run workflow 堆队列（只保留最新一次）
+concurrency:
+  group: xzp-nfc-build
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -19,6 +24,7 @@ jobs:
 
     - name: Install Dependencies (安装编译工具)
       run: |
+        set -e
         sudo apt-get update
         sudo apt-get install -y \
           bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf \
@@ -29,6 +35,7 @@ jobs:
 
     - name: Install Repo Tool
       run: |
+        set -e
         mkdir -p ~/bin
         curl -L https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
         chmod a+x ~/bin/repo
@@ -45,34 +52,36 @@ jobs:
         echo "== 1) Init LOS 22 env (Android 15) =="
         repo init -u https://github.com/LineageOS/android.git -b lineage-22.0 --depth=1
 
-        echo "== 2) Write local manifest forcing LOS21 device/kernel repos =="
+        echo "== 2) Reset local manifests (avoid stale conflicts) =="
+        rm -rf .repo/local_manifests
         mkdir -p .repo/local_manifests
+
+        echo "== 3) Write local manifest (use non-conflicting remote name: gh) =="
         cat > .repo/local_manifests/roomservice.xml <<'EOF'
         <?xml version="1.0" encoding="UTF-8"?>
         <manifest>
-            <!-- Make sure the remote exists -->
-            <remote name="github" fetch="https://github.com/" />
+            <!-- 重要：不要用 name="github"，Lineage 主 manifest 已经定义过，会冲突 -->
+            <remote name="gh" fetch="https://github.com/" />
 
-            <!-- Kernel / device trees from LOS21 (legacy sony) -->
             <project name="whatawurst/android_kernel_sony_msm8998"
                      path="kernel/sony/msm8998"
-                     remote="github"
+                     remote="gh"
                      revision="lineage-21" />
 
             <project name="LineageOS/android_device_sony_maple"
                      path="device/sony/maple"
-                     remote="github"
+                     remote="gh"
                      revision="lineage-21" />
 
             <project name="whatawurst/android_device_sony_yoshino-common"
                      path="device/sony/yoshino-common"
-                     remote="github"
+                     remote="gh"
                      revision="lineage-21" />
 
-            <!-- 你如果确实需要 poplar_kddi device tree（仅参考/比对），保留也行 -->
+            <!-- 可选：仅用于参考/对照 poplar -->
             <project name="whatawurst/android_device_sony_poplar_kddi"
                      path="device/sony/poplar_kddi"
-                     remote="github"
+                     remote="gh"
                      revision="lineage-21" />
         </manifest>
         EOF
@@ -92,7 +101,6 @@ jobs:
       working-directory: ./lineage
       run: |
         set -euo pipefail
-
         echo "=== 开始调整内核 defconfig ==="
 
         # defconfig 常见候选路径（不同树可能略有变化）
@@ -131,7 +139,6 @@ jobs:
         set_kcfg CONFIG_SONY_CXD224X y "$CONFIG_FILE"
 
         echo "== 为避免冲突，先禁用 NXP PN553 =="
-        # （你之前写成 y 了，这里改为 n）
         set_kcfg CONFIG_NFC_PN553 n "$CONFIG_FILE"
 
         echo "== 修改结果（defconfig 片段）=="
@@ -144,14 +151,12 @@ jobs:
 
         source build/envsetup.sh
 
-        # 允许跨版本编译/缺失依赖（你原本就这么做）
+        # 允许跨版本编译/缺失依赖
         export ALLOW_MISSING_DEPENDENCIES=true
         export BUILD_BROKEN_MISSING_REQUIRED_MODULES=true
         export BUILD_BROKEN_ELF_PREBUILT_PRODUCT_COPY_FILES=true
 
         lunch lineage_maple-userdebug
-
-        # 编译 bootimage (内核 + ramdisk)
         mka bootimage
 
         echo "=== 编译完成：验证最终 kernel .config 是否真的生效 ==="
@@ -162,7 +167,7 @@ jobs:
         else
           echo "⚠️ 未找到 $KCFG（不同内核构建系统可能路径不同）"
           echo "尝试搜索 .config："
-          find out -maxdepth 6 -name ".config" -type f | head -n 20 || true
+          find out -maxdepth 6 -name ".config" -type f | head -n 30 || true
         fi
 
         echo "=== boot.img 输出检查 ==="
