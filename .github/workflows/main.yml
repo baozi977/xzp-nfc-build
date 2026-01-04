@@ -10,13 +10,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install deps
+        
+      - name: Install magiskboot
         run: |
           set -eux
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ccache curl flex git libelf-dev libssl-dev \
-            python3 unzip zlib1g-dev lz4
+          sudo apt-get install -y --no-install-recommends unzip curl ca-certificates
+
+          MAGISK_VER="26.4"
+          URL="https://github.com/topjohnwu/Magisk/releases/download/v${MAGISK_VER}/Magisk-v${MAGISK_VER}.apk"
+
+          curl -fL --retry 5 --retry-delay 2 -o magisk.apk "$URL"
+          file magisk.apk
+          unzip -q magisk.apk
+
+          chmod +x lib/x86_64/magiskboot
+          sudo mv lib/x86_64/magiskboot /usr/local/bin/magiskboot
+          magiskboot --help | head -n 5 || true
+
 
       - name: Install magiskboot
         run: |
