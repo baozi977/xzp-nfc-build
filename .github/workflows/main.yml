@@ -1,42 +1,70 @@
-name: build-and-repack-boot
+name: build-kernel-and-repack-boot
 
 on:
   workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "Kernel git repo URL"
+        required: true
+        default: "https://github.com/LineageOS/android_kernel_sony_msm8998.git"
+      kernel_branch:
+        description: "Kernel branch"
+        required: true
+        default: "lineage-22.0"
+      defconfig:
+        description: "Kernel defconfig name"
+        required: true
+        default: "lineage_yoshino_defconfig"
+      pagesize:
+        description: "boot.img pagesize (your boot is 4096)"
+        required: true
+        default: "4096"
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+    env:
+      TZ: Asia/Tokyo
+
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-        
-      - name: Install magiskboot
+      - name: Install deps
         run: |
           set -eux
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends unzip curl ca-certificates
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex git libelf-dev libssl-dev \
+            python3 unzip zlib1g-dev lz4 ca-certificates file
 
-          MAGISK_VER="26.4"
-          URL="https://github.com/topjohnwu/Magisk/releases/download/v${MAGISK_VER}/Magisk-v${MAGISK_VER}.apk"
-
-          curl -fL --retry 5 --retry-delay 2 -o magisk.apk "$URL"
-          file magisk.apk
-          unzip -q magisk.apk
-
-          chmod +x lib/x86_64/magiskboot
-          sudo mv lib/x86_64/magiskboot /usr/local/bin/magiskboot
-          magiskboot --help | head -n 5 || true
-
-
+      # --- Install magiskboot (robust: auto-find binary in APK) ---
       - name: Install magiskboot
         run: |
           set -eux
-          curl -L -o magisk.apk https://github.com/topjohnwu/Magisk/releases/latest/download/Magisk-v26.4.apk
-          unzip -q magisk.apk
-          chmod +x lib/x86_64/magiskboot
-          sudo mv lib/x86_64/magiskboot /usr/local/bin/magiskboot
+          MAGISK_VER="26.4"
+          URL="https://github.com/topjohnwu/Magisk/releases/download/v${MAGISK_VER}/Magisk-v${MAGISK_VER}.apk"
 
+          rm -rf magisk_unpack
+          mkdir -p magisk_unpack
+
+          curl -fL --retry 5 --retry-delay 2 -o magisk.apk "$URL"
+          file magisk.apk
+          unzip -q magisk.apk -d magisk_unpack
+
+          echo "Searching magiskboot..."
+          MB="$(find magisk_unpack -type f -name magiskboot -print | head -n 1 || true)"
+          if [ -z "$MB" ]; then
+            echo "ERROR: magiskboot not found inside APK. Listing:"
+            find magisk_unpack -maxdepth 4 -type f | head -n 300
+            exit 1
+          fi
+
+          chmod +x "$MB"
+          sudo cp "$MB" /usr/local/bin/magiskboot
+          magiskboot --help | head -n 10 || true
+
+      # --- Build dtbTool (Qualcomm qcdt dtb blob generator) ---
       - name: Build dtbTool (libufdt)
         run: |
           set -eux
@@ -44,40 +72,61 @@ jobs:
           cd libufdt
           make -j"$(nproc)"
           sudo cp utils/src/dtbTool /usr/local/bin/dtbTool
+          dtbTool --help | head -n 10 || true
 
-      - name: Build kernel (Image.gz + dtb)
-        run: |
-          set -eux
-          chmod +x ./build_kernel.sh
-          ./build_kernel.sh
-          test -f out/Image.gz
-          test -d out/dtb
-
-      - name: Pack kernel_dtb (pagesize 4096)
-        run: |
-          set -eux
-          dtbTool -o out/kernel_dtb -s 4096 out/dtb
-          test -f out/kernel_dtb
-          ls -lah out/kernel_dtb
-
-      - name: Repack boot.img with new kernel + dtb
+      # --- Build kernel + dtbs using your script ---
+      - name: Build kernel (Image.gz + dtbs)
         run: |
           set -eux
           test -f boot.img
+          chmod +x ./build_kernel.sh
+          ./build_kernel.sh "${{ inputs.kernel_repo }}" "${{ inputs.kernel_branch }}" "${{ inputs.defconfig }}"
+
+          # Expect outputs
+          test -f out/Image.gz
+          test -d out/dtb
+
+          echo "Image.gz:"
+          ls -lah out/Image.gz
+          echo "DTB count:"
+          ls -1 out/dtb | wc -l
+
+      # --- Pack dtb blob to match your boot.img format (kernel_dtb section) ---
+      - name: Pack kernel_dtb (qcdt)
+        run: |
+          set -eux
+          PAGESIZE="${{ inputs.pagesize }}"
+          # -s must match boot.img pagesize (your boot is 4096)
+          dtbTool -o out/kernel_dtb -s "${PAGESIZE}" out/dtb
+          test -f out/kernel_dtb
+          ls -lah out/kernel_dtb
+
+      # --- Unpack base boot, replace kernel + kernel_dtb, repack ---
+      - name: Repack boot.img with new kernel + dtb
+        run: |
+          set -eux
           cp boot.img boot-base.img
+
+          # Print header info for traceability
+          magiskboot unpack -h boot-base.img
 
           magiskboot unpack boot-base.img
 
-          # 你的是 boot header v0 + kernel_dtb 分离结构：两个都替换
+          # Your boot is HEADER_VER 0 and has separate kernel_dtb -> replace both
           cp out/Image.gz kernel
           cp out/kernel_dtb kernel_dtb
 
           magiskboot repack boot-base.img
           mv new-boot.img boot-nfc.img
-          ls -lah boot-nfc.img
 
-      - name: Upload boot
+          echo "Result:"
+          ls -lah boot-nfc.img
+          sha256sum boot-nfc.img | tee boot-nfc.img.sha256
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: boot-nfc
-          path: boot-nfc.img
+          path: |
+            boot-nfc.img
+            boot-nfc.img.sha256
