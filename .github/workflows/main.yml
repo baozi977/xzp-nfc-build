@@ -12,13 +12,9 @@ on:
         required: true
         default: "lineage-22.0"
       defconfig:
-        description: "Kernel defconfig name (optional; will auto-pick if missing)"
+        description: "Kernel defconfig name (optional; build_kernel.sh will auto-pick if missing/wrong)"
         required: true
         default: "lineage_yoshino_defconfig"
-      pagesize:
-        description: "boot.img pagesize (your boot is 4096)"
-        required: true
-        default: "4096"
       magisk_ver:
         description: "Magisk version to extract magiskboot from"
         required: true
@@ -56,7 +52,6 @@ jobs:
           curl -fL --retry 5 --retry-delay 2 -o magisk.apk "$URL"
           unzip -q magisk.apk -d magisk_unpack
 
-          # GitHub runner is x86_64; Magisk APK provides lib/x86_64/libmagiskboot.so
           MB_SO="magisk_unpack/lib/x86_64/libmagiskboot.so"
           if [ ! -f "$MB_SO" ]; then
             echo "x86_64 lib not found, search any libmagiskboot.so..."
@@ -74,16 +69,7 @@ jobs:
           sudo chmod +x /usr/local/bin/magiskboot
           magiskboot --help | head -n 15 || true
 
-      # ---- Build standalone dtbTool (C source, gcc build) ----
-      - name: Build dtbTool
-        run: |
-          set -eux
-          git clone --depth=1 https://github.com/rajatgupta1998/android_tools_system_dtbTool.git dtbtool_src
-          gcc dtbtool_src/source/dtbtool.c -o dtbTool
-          sudo mv dtbTool /usr/local/bin/dtbTool
-          /usr/local/bin/dtbTool --help || true
-
-      # ---- Detect available kernel branch (fallback) ----
+      # ---- Select kernel branch (auto fallback) ----
       - name: Select kernel branch (auto fallback)
         id: pick_branch
         run: |
@@ -111,62 +97,57 @@ jobs:
           echo "ERROR: No suitable branch found on $REPO"
           exit 1
 
-      # ---- Kernel build (uses your build_kernel.sh). Token injected here. ----
+      # ---- Unpack base boot first & save its kernel_dtb ----
+      - name: Unpack base boot & save base kernel_dtb
+        run: |
+          set -eux
+          test -f boot.img
+          cp boot.img boot-base.img
+
+          # Print header info (yours is HEADER_VER 0)
+          magiskboot unpack -h boot-base.img
+
+          # Unpack to get kernel / ramdisk / kernel_dtb
+          magiskboot unpack boot-base.img
+
+          # Save original kernel_dtb for reuse
+          test -f kernel_dtb
+          cp kernel_dtb base_kernel_dtb
+          ls -lah base_kernel_dtb
+
+      # ---- Build kernel (Image.gz + dtbs) ----
       - name: Build kernel (Image.gz + dtbs)
         env:
-          # Put your PAT in repo Settings -> Secrets -> Actions:
+          # Optional: add PAT in repo Settings -> Secrets -> Actions:
           # Name: KERNEL_GITHUB_TOKEN
           KERNEL_GITHUB_TOKEN: ${{ secrets.KERNEL_GITHUB_TOKEN }}
         run: |
           set -eux
-          test -f boot.img
           test -f ./build_kernel.sh
           chmod +x ./build_kernel.sh
 
+          # build_kernel.sh must output:
+          #   out/Image.gz
+          #   out/dtb/   (not used now, but kept for future DT work)
           ./build_kernel.sh "${{ inputs.kernel_repo }}" "${{ steps.pick_branch.outputs.branch }}" "${{ inputs.defconfig }}"
 
           test -f out/Image.gz
-          test -d out/dtb
           ls -lah out/Image.gz
-          echo "DTB count: $(ls -1 out/dtb | wc -l)"
 
-      # ---- Pack kernel_dtb blob for boot header v0 ----
-      - name: Pack kernel_dtb (qcdt)
+      # ---- Repack: replace kernel only, reuse base kernel_dtb ----
+      - name: Repack boot.img (replace kernel only, reuse base kernel_dtb)
         run: |
           set -eux
-          PAGESIZE="${{ inputs.pagesize }}"
 
-          set +e
-          /usr/local/bin/dtbTool -o out/kernel_dtb -s "${PAGESIZE}" out/dtb
-          RC=$?
-          set -e
-
-          if [ $RC -ne 0 ]; then
-            echo "dtbTool simple mode failed, retry with -p kernel/scripts/dtc/ if present..."
-            if [ -d "kernel/scripts/dtc" ]; then
-              /usr/local/bin/dtbTool -o out/kernel_dtb -s "${PAGESIZE}" -p kernel/scripts/dtc/ out/dtb
-            else
-              echo "No kernel/scripts/dtc; cannot use -p mode."
-              exit 1
-            fi
-          fi
-
-          test -f out/kernel_dtb
-          ls -lah out/kernel_dtb
-
-      # ---- Repack base boot: replace kernel + kernel_dtb ----
-      - name: Repack boot.img with new kernel + dtb
-        run: |
-          set -eux
-          cp boot.img boot-base.img
-
-          magiskboot unpack -h boot-base.img
-          magiskboot unpack boot-base.img
-
-          # HEADER_VER 0 + separate kernel_dtb -> replace BOTH
+          # Replace kernel with newly built Image.gz
+          test -f out/Image.gz
           cp out/Image.gz kernel
-          cp out/kernel_dtb kernel_dtb
 
+          # Reuse original dtb blob (critical: avoids dtbTool parsing issues)
+          test -f base_kernel_dtb
+          cp base_kernel_dtb kernel_dtb
+
+          # Repack based on original boot header/params
           magiskboot repack boot-base.img
           mv new-boot.img boot-nfc.img
 
