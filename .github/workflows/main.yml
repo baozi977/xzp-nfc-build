@@ -1,7 +1,69 @@
+name: Build XZP Hybrid Kernel (NFC Fixed - Minimal + /mnt)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: xzp-nfc-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Maximize Build Space (清理空间)
+      uses: easimon/maximize-build-space@master
+      with:
+        root-reserve-mb: 2048
+        swap-size-mb: 10240
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-codeql: 'true'
+        remove-haskell: 'true'
+        remove-docker-images: 'true'
+
+    - name: Show Disk (before)
+      run: |
+        set -e
+        df -h
+        echo "== largest dirs in / =="
+        sudo du -xhd1 / 2>/dev/null | sort -h | tail -n 20 || true
+
+    - name: Install Dependencies
+      run: |
+        set -e
+        sudo apt-get update
+        sudo apt-get install -y \
+          bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf \
+          lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool \
+          libncurses5 libncurses5-dev libssl-dev libxml2 libxml2-utils \
+          lzop rsync schedtool squashfs-tools xsltproc zip zlib1g-dev \
+          python3 python-is-python3
+
+    - name: Install Repo Tool
+      run: |
+        set -e
+        mkdir -p ~/bin
+        curl -L https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+        chmod a+x ~/bin/repo
+        echo "$HOME/bin" >> $GITHUB_PATH
+        git config --global user.name "GitHub Action"
+        git config --global user.email "action@github.com"
+        # 关键：禁止 git 在 CI 里弹出用户名密码提示（避免 Username for 'https://github.com'）
+        echo "GIT_TERMINAL_PROMPT=0" >> $GITHUB_ENV
+
+    - name: Prepare workspace in /mnt (关键：用大盘)
+      run: |
+        set -e
+        sudo mkdir -p /mnt/lineage
+        sudo chown -R "$USER:$USER" /mnt/lineage
+        echo "WORKDIR=/mnt/lineage" >> $GITHUB_ENV
+        df -h /mnt || true
+
     - name: Init Repo (Minimal manifest, NOT full Lineage)
       run: |
         set -e
-        export GIT_TERMINAL_PROMPT=0
         cd "$WORKDIR"
 
         cat > minimal.xml <<'EOF'
@@ -11,6 +73,7 @@
           <remote name="gh"  fetch="https://github.com/" />
           <default remote="los" revision="lineage-22.0" />
 
+          <!-- ✅ 只保留能跑 build/envsetup.sh + lunch + bootimage 的核心 -->
           <project name="android_build" path="build" />
           <project name="android_build_soong" path="build/soong" />
           <project name="android_system_core" path="system/core" />
@@ -25,6 +88,7 @@
           <project name="android_external_libcxx" path="external/libcxx" />
           <project name="android_external_zlib" path="external/zlib" />
 
+          <!-- ✅ 你的混合来源：LOS21 kernel + device + common -->
           <project name="whatawurst/android_kernel_sony_msm8998"
                    path="kernel/sony/msm8998"
                    remote="gh"
@@ -40,6 +104,7 @@
         </manifest>
         EOF
 
+        # ✅ 关键修复点：不要指定 --repo-url/--repo-rev（避免 stable 不存在导致认证/拉取失败）
         repo init -u . -m minimal.xml \
           --depth=1 \
           --partial-clone \
@@ -47,3 +112,97 @@
 
         echo "== minimal.xml =="
         cat minimal.xml
+
+    - name: Repo Sync (heartbeat + disk monitor)
+      run: |
+        set -euo pipefail
+        cd "$WORKDIR"
+
+        echo "== repo sync start =="
+        ( repo sync -c -j4 --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune ) &
+        SYNC_PID=$!
+
+        while kill -0 "$SYNC_PID" 2>/dev/null; do
+          echo "[sync] still running... $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          df -h | sed -n '1,8p'
+          sleep 30
+        done
+
+        wait "$SYNC_PID"
+        echo "== repo sync done =="
+
+    - name: Show Disk (after sync)
+      run: |
+        set -e
+        cd "$WORKDIR"
+        df -h
+        du -sh .repo || true
+        du -sh . || true
+
+    - name: Patch defconfig (enable CXD224X, disable PN553)
+      run: |
+        set -euo pipefail
+        cd "$WORKDIR"
+
+        CANDIDATES=(
+          "kernel/sony/msm8998/arch/arm64/configs/lineage_yoshino_defconfig"
+          "kernel/sony/msm8998/arch/arm64/configs/yoshino_defconfig"
+          "kernel/sony/msm8998/arch/arm64/configs/lineage_defconfig"
+        )
+
+        CONFIG_FILE=""
+        for f in "${CANDIDATES[@]}"; do
+          if [ -f "$f" ]; then CONFIG_FILE="$f"; break; fi
+        done
+
+        if [ -z "$CONFIG_FILE" ]; then
+          echo "❌ defconfig not found"
+          ls -la kernel/sony/msm8998/arch/arm64/configs || true
+          exit 1
+        fi
+
+        set_kcfg() {
+          local key="$1" val="$2" file="$3"
+          if grep -qE "^${key}=" "$file"; then
+            sed -i "s/^${key}=.*/${key}=${val}/" "$file"
+          else
+            echo "${key}=${val}" >> "$file"
+          fi
+        }
+
+        set_kcfg CONFIG_SONY_CXD224X y "$CONFIG_FILE"
+        set_kcfg CONFIG_NFC_PN553 n "$CONFIG_FILE"
+
+        echo "== defconfig result =="
+        grep -nE "CONFIG_SONY_CXD224X=|CONFIG_NFC_PN553=" "$CONFIG_FILE" || true
+
+    - name: Build Boot Image
+      run: |
+        set -euo pipefail
+        cd "$WORKDIR"
+
+        source build/envsetup.sh
+
+        export ALLOW_MISSING_DEPENDENCIES=true
+        export BUILD_BROKEN_MISSING_REQUIRED_MODULES=true
+        export BUILD_BROKEN_ELF_PREBUILT_PRODUCT_COPY_FILES=true
+
+        lunch lineage_maple-userdebug
+        mka bootimage
+
+        echo "== boot.img =="
+        ls -la out/target/product/maple/boot.img
+
+        echo "== verify kernel config (.config) =="
+        KCFG="out/target/product/maple/obj/KERNEL_OBJ/.config"
+        if [ -f "$KCFG" ]; then
+          grep -nE "CONFIG_SONY_CXD224X=|CONFIG_NFC_PN553=" "$KCFG" || true
+        else
+          find out -maxdepth 6 -name ".config" -type f | head -n 30 || true
+        fi
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: fixed_boot_image_for_los22
+        path: /mnt/lineage/out/target/product/maple/boot.img
