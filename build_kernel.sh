@@ -11,8 +11,18 @@ OUTROOT="${ROOT}/out"
 rm -rf "${OUTROOT}"
 mkdir -p "${OUTROOT}"
 
+# ---- FIX: avoid GitHub auth prompt in Actions ----
+export GIT_TERMINAL_PROMPT=0
+# 清掉可能被 actions/checkout 写入的认证头（否则外部 clone 会被当成需要认证）
+git config --global --unset-all http.https://github.com/.extraheader || true
+git config --global --unset-all http.https://github.com/.header || true
+git config --global --unset-all http.extraheader || true
+
 rm -rf kernel
-git clone --depth=1 -b "${KERNEL_BRANCH}" "${KERNEL_REPO}" kernel
+
+# 用 “干净的环境” clone 公共仓库
+env -u GITHUB_TOKEN -u GH_TOKEN -u GIT_ASKPASS \
+  git clone --depth=1 -b "${KERNEL_BRANCH}" "${KERNEL_REPO}" kernel
 
 export ARCH=arm64
 export SUBARCH=arm64
