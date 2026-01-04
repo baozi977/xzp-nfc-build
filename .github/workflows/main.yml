@@ -1,4 +1,4 @@
-name: Build XZP Hybrid Kernel (NFC Fixed - Minimal + AOSP prebuilts)
+name: Build XZP Hybrid Kernel (NFC Kernel Only - Minimal + DT check)
 
 on:
   workflow_dispatch:
@@ -58,7 +58,6 @@ jobs:
         set -e
         mkdir -p "$GITHUB_WORKSPACE/lineage"
         echo "WORKDIR=$GITHUB_WORKSPACE/lineage" >> $GITHUB_ENV
-        echo "WORKDIR=$GITHUB_WORKSPACE/lineage"
         df -h "$GITHUB_WORKSPACE" || true
 
     - name: Create local manifest git repo (minimal.xml)
@@ -80,14 +79,19 @@ jobs:
 
           <default remote="los" revision="lineage-22.0" />
 
-          <!-- ✅ LOS 22 构建骨架（有 lineage-22.0 分支的那部分） -->
+          <!-- LOS 22 build skeleton -->
           <project name="android_build" path="build" />
           <project name="android_build_soong" path="build/soong" />
           <project name="android_system_core" path="system/core" />
           <project name="android_system_sepolicy" path="system/sepolicy" />
           <project name="android_frameworks_base" path="frameworks/base" />
 
-          <!-- ✅ AOSP upstream：这些仓库经常没有 lineage-22.0 分支，改用 googlesource main -->
+          <!-- Commonly needed -->
+          <project name="android_hardware_interfaces" path="hardware/interfaces" />
+          <project name="android_system_tools_mkbootimg" path="system/tools/mkbootimg" />
+          <project name="android_system_extras" path="system/extras" />
+
+          <!-- AOSP upstream -->
           <project name="platform/external/libcxx"
                    path="external/libcxx"
                    remote="aosp"
@@ -110,13 +114,12 @@ jobs:
                    remote="aosp"
                    revision="main" />
 
-          <!-- ✅ 你的混合来源：LOS21 kernel + device + common -->
+          <!-- Hybrid sources -->
           <project name="whatawurst/android_kernel_sony_msm8998"
                    path="kernel/sony/msm8998"
                    remote="gh"
                    revision="lineage-21" />
 
-          <!-- ✅ 关键修复：maple 的 device tree 用 whatawurst 的仓库，不用 LineageOS 组织仓库 -->
           <project name="whatawurst/android_device_sony_maple"
                    path="device/sony/maple"
                    remote="gh"
@@ -151,23 +154,17 @@ jobs:
         echo "== repo sync =="
         repo sync -c -j1 --fail-fast --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune
 
-    - name: Show Disk (after sync)
-      run: |
-        set -e
-        cd "$WORKDIR"
-        df -h
-        du -sh .repo || true
-        du -sh . || true
-
     - name: Patch defconfig (enable CXD224X, disable PN553)
       run: |
         set -euo pipefail
         cd "$WORKDIR"
 
+        # ✅ 这里按你实际目录：优先找 maple 专用 defconfig
         CANDIDATES=(
-          "kernel/sony/msm8998/arch/arm64/configs/lineage_yoshino_defconfig"
-          "kernel/sony/msm8998/arch/arm64/configs/yoshino_defconfig"
-          "kernel/sony/msm8998/arch/arm64/configs/lineage_defconfig"
+          "kernel/sony/msm8998/arch/arm64/configs/lineage-msm8998-yoshino-maple_defconfig"
+          "kernel/sony/msm8998/arch/arm64/configs/lineage-msm8998-yoshino-maple_dsds_defconfig"
+          "kernel/sony/msm8998/arch/arm64/configs/lineage-msm8998-yoshino-poplar_kddi_defconfig"
+          "kernel/sony/msm8998/arch/arm64/configs/defconfig"
         )
 
         CONFIG_FILE=""
@@ -176,10 +173,12 @@ jobs:
         done
 
         if [ -z "$CONFIG_FILE" ]; then
-          echo "❌ defconfig not found"
+          echo "❌ defconfig not found. Available configs:"
           ls -la kernel/sony/msm8998/arch/arm64/configs || true
           exit 1
         fi
+
+        echo "✅ Using defconfig: $CONFIG_FILE"
 
         set_kcfg() {
           local key="$1" val="$2" file="$3"
@@ -196,7 +195,20 @@ jobs:
         echo "== defconfig result =="
         grep -nE "CONFIG_SONY_CXD224X=|CONFIG_NFC_PN553=" "$CONFIG_FILE" || true
 
-    - name: Build Boot Image
+    - name: DT sanity check (does maple DTS mention cxd224x/bd7602?)
+      run: |
+        set -euo pipefail
+        cd "$WORKDIR"
+
+        echo "== Search DTS/DTBO sources for cxd224x/bd7602/felica/nfc =="
+        git grep -nE "cxd224x|bd7602|felica|osaifu|nfc" \
+          device/sony/maple device/sony/yoshino-common kernel/sony/msm8998/arch/arm64/boot/dts \
+          || true
+
+        echo "== List maple DT related files (best effort) =="
+        find device/sony/maple -maxdepth 3 -type f \( -iname "*dts*" -o -iname "*dtbo*" \) 2>/dev/null || true
+
+    - name: Build Boot Image (kernel-only target)
       run: |
         set -euo pipefail
         cd "$WORKDIR"
@@ -215,5 +227,5 @@ jobs:
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: fixed_boot_image_for_los22
+        name: boot_img_kernel_only_cxd224x
         path: ${{ github.workspace }}/lineage/out/target/product/maple/boot.img
