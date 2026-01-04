@@ -1,32 +1,38 @@
 #!/usr/bin/env bash
 set -euxo pipefail
 
-# 你要的内核仓库/分支（先用 lineage-22.0；如果不存在再改 21.0）
-KERNEL_REPO="https://github.com/LineageOS/android_kernel_sony_msm8998.git"
-KERNEL_BRANCH="lineage-22.0"
+KERNEL_REPO="${1:-https://github.com/LineageOS/android_kernel_sony_msm8998.git}"
+KERNEL_BRANCH="${2:-lineage-22.0}"
+DEFCONFIG="${3:-lineage_yoshino_defconfig}"
 
-# 输出目录
-mkdir -p out
+ROOT="$(pwd)"
+OUTROOT="${ROOT}/out"
 
-# 拉内核源码
+rm -rf "${OUTROOT}"
+mkdir -p "${OUTROOT}"
+
 rm -rf kernel
 git clone --depth=1 -b "${KERNEL_BRANCH}" "${KERNEL_REPO}" kernel
 
-# 编译
 export ARCH=arm64
 export SUBARCH=arm64
 
 cd kernel
 
-# 这里 defconfig 先用常见的 yoshino（之后我们再按你树里实际名字改）
-DEFCONFIG="lineage_yoshino_defconfig"
-
+echo "Using defconfig: ${DEFCONFIG}"
 make O=out "${DEFCONFIG}"
 make -j"$(nproc)" O=out Image.gz dtbs
 
-# 拷贝产物
-cp -f out/arch/arm64/boot/Image.gz ../out/Image.gz
+cp -f out/arch/arm64/boot/Image.gz "${OUTROOT}/Image.gz"
 
-# 收集 dtb（目录可能因内核树略有差异；先用通用抓法）
-mkdir -p ../out/dtb
-find out/arch/arm64/boot/dts -name "*.dtb" -maxdepth 6 -print -exec cp -f {} ../out/dtb/ \;
+mkdir -p "${OUTROOT}/dtb"
+DTB_DIR="out/arch/arm64/boot/dts"
+if [ ! -d "${DTB_DIR}" ]; then
+  echo "ERROR: DTB dir not found: ${DTB_DIR}"
+  find out -maxdepth 4 -type d | head -n 200
+  exit 1
+fi
+
+find "${DTB_DIR}" -name "*.dtb" -maxdepth 6 -print -exec cp -f {} "${OUTROOT}/dtb/" \;
+
+echo "Collected dtbs: $(ls -1 "${OUTROOT}/dtb" | wc -l)"
