@@ -3,20 +3,16 @@ name: build-kernel-and-repack-boot
 on:
   workflow_dispatch:
     inputs:
-      kernel_repo:
-        description: "Kernel git repo URL"
-        required: true
-        default: "https://github.com/LineageOS/android_kernel_sony_msm8998.git"
-      kernel_branch:
-        description: "Kernel branch"
+      kernel_ref:
+        description: "Kernel ref (branch or tag). Example: lineage-22.0"
         required: true
         default: "lineage-22.0"
       defconfig:
-        description: "Kernel defconfig name"
+        description: "Kernel defconfig"
         required: true
         default: "lineage_yoshino_defconfig"
       pagesize:
-        description: "boot.img pagesize (your boot is 4096)"
+        description: "boot pagesize (yours is 4096)"
         required: true
         default: "4096"
 
@@ -27,8 +23,17 @@ jobs:
       TZ: Asia/Tokyo
 
     steps:
-      - name: Checkout repo
+      - name: Checkout this repo (boot.img + scripts)
         uses: actions/checkout@v4
+
+      # 关键：用 actions/checkout 把内核仓库拉到 kernel/，避免 git clone 认证提示
+      - name: Checkout kernel repo
+        uses: actions/checkout@v4
+        with:
+          repository: LineageOS/android_kernel_sony_msm8998
+          ref: ${{ inputs.kernel_ref }}
+          path: kernel
+          fetch-depth: 1
 
       - name: Install deps
         run: |
@@ -47,23 +52,17 @@ jobs:
 
           rm -rf magisk_unpack
           mkdir -p magisk_unpack
-
           curl -fL --retry 5 --retry-delay 2 -o magisk.apk "$URL"
           unzip -q magisk.apk -d magisk_unpack
 
           MB_SO="magisk_unpack/lib/x86_64/libmagiskboot.so"
-          if [ ! -f "$MB_SO" ]; then
-            echo "ERROR: $MB_SO not found. Listing:"
-            find magisk_unpack -maxdepth 4 -type f | head -n 200
-            exit 1
-          fi
-
+          test -f "$MB_SO"
           chmod +x "$MB_SO"
           sudo cp "$MB_SO" /usr/local/bin/magiskboot
           sudo chmod +x /usr/local/bin/magiskboot
           magiskboot --help | head -n 10 || true
 
-      # --- Build Qualcomm dtbTool (standalone C source, gcc build) ---
+      # --- Build dtbTool (standalone C source, gcc build) ---
       - name: Build dtbTool
         run: |
           set -eux
@@ -72,29 +71,25 @@ jobs:
           sudo mv dtbTool /usr/local/bin/dtbTool
           /usr/local/bin/dtbTool --help || true
 
-      # --- Build kernel + dtbs using your script ---
+      # --- Build kernel + dtbs (no cloning here anymore) ---
       - name: Build kernel (Image.gz + dtbs)
         run: |
           set -eux
           test -f boot.img
+          test -d kernel
           chmod +x ./build_kernel.sh
-          ./build_kernel.sh "${{ inputs.kernel_repo }}" "${{ inputs.kernel_branch }}" "${{ inputs.defconfig }}"
+          ./build_kernel.sh "${{ inputs.defconfig }}"
 
           test -f out/Image.gz
           test -d out/dtb
           ls -lah out/Image.gz
           echo "DTB count: $(ls -1 out/dtb | wc -l)"
 
-      # --- Pack kernel_dtb (qcdt) ---
       - name: Pack kernel_dtb (qcdt)
         run: |
           set -eux
           PAGESIZE="${{ inputs.pagesize }}"
-
-          # dtbTool usage differs across implementations. This one expects:
-          # dtbTool -o <out> -s <pagesize> -p <dtc_path> <dtb_dir>
-          # Some builds accept without -p; we try with -p first, then fallback.
-
+          # 先尝试带 -p（有 dtc 时更稳），失败再退回不带 -p
           if [ -d "kernel/scripts/dtc" ]; then
             DTC_PATH="kernel/scripts/dtc/"
           else
@@ -107,29 +102,25 @@ jobs:
           set -e
 
           if [ $RC -ne 0 ]; then
-            echo "dtbTool with -p failed, retry without -p..."
             /usr/local/bin/dtbTool -o out/kernel_dtb -s "${PAGESIZE}" out/dtb
           fi
 
           test -f out/kernel_dtb
           ls -lah out/kernel_dtb
 
-      # --- Unpack base boot, replace kernel + kernel_dtb, repack ---
       - name: Repack boot.img with new kernel + dtb
         run: |
           set -eux
           cp boot.img boot-base.img
-
           magiskboot unpack -h boot-base.img
           magiskboot unpack boot-base.img
 
-          # Your boot is HEADER_VER 0 + separate kernel_dtb -> replace BOTH
+          # HEADER_VER 0 + kernel_dtb 分离 -> 两个都替换
           cp out/Image.gz kernel
           cp out/kernel_dtb kernel_dtb
 
           magiskboot repack boot-base.img
           mv new-boot.img boot-nfc.img
-
           ls -lah boot-nfc.img
           sha256sum boot-nfc.img | tee boot-nfc.img.sha256
 
