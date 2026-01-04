@@ -154,31 +154,62 @@ jobs:
         echo "== repo sync =="
         repo sync -c -j1 --fail-fast --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune
 
-    - name: Patch defconfig (enable CXD224X, disable PN553)
+    # ✅✅✅ 关键：defconfig 选择逻辑（完整替换版）
+    - name: Patch defconfig (auto-pick maple defconfig; enable CXD224X, disable PN553)
       run: |
         set -euo pipefail
         cd "$WORKDIR"
 
-        # ✅ 这里按你实际目录：优先找 maple 专用 defconfig
+        CFG_DIR="kernel/sony/msm8998/arch/arm64/configs"
+        if [ ! -d "$CFG_DIR" ]; then
+          echo "❌ configs dir not found: $CFG_DIR"
+          exit 1
+        fi
+
+        echo "== Available defconfigs (top) =="
+        ls -1 "$CFG_DIR" | sed -n '1,120p'
+
+        # 优先级：
+        # 1) maple 专用 defconfig（单卡）
+        # 2) maple_dsds（双卡）
+        # 3) poplar_kddi（你备用参考）
+        # 4) poplar/lilac（兜底）
+        # 5) defconfig（最后兜底）
         CANDIDATES=(
-          "kernel/sony/msm8998/arch/arm64/configs/lineage-msm8998-yoshino-maple_defconfig"
-          "kernel/sony/msm8998/arch/arm64/configs/lineage-msm8998-yoshino-maple_dsds_defconfig"
-          "kernel/sony/msm8998/arch/arm64/configs/lineage-msm8998-yoshino-poplar_kddi_defconfig"
-          "kernel/sony/msm8998/arch/arm64/configs/defconfig"
+          "$CFG_DIR/lineage-msm8998-yoshino-maple_defconfig"
+          "$CFG_DIR/lineage-msm8998-yoshino-maple_dsds_defconfig"
+          "$CFG_DIR/lineage-msm8998-yoshino-poplar_kddi_defconfig"
+          "$CFG_DIR/lineage-msm8998-yoshino-poplar_defconfig"
+          "$CFG_DIR/lineage-msm8998-yoshino-lilac_defconfig"
+          "$CFG_DIR/defconfig"
         )
 
         CONFIG_FILE=""
         for f in "${CANDIDATES[@]}"; do
-          if [ -f "$f" ]; then CONFIG_FILE="$f"; break; fi
+          if [ -f "$f" ]; then
+            CONFIG_FILE="$f"
+            break
+          fi
         done
 
+        # 如果候选都没命中，那就自动搜索：任何包含 maple 的 lineage defconfig
         if [ -z "$CONFIG_FILE" ]; then
-          echo "❌ defconfig not found. Available configs:"
-          ls -la kernel/sony/msm8998/arch/arm64/configs || true
+          echo "!! candidates not found, trying auto-search for maple defconfig..."
+          FOUND="$(ls -1 "$CFG_DIR"/lineage*-maple*_defconfig 2>/dev/null | head -n 1 || true)"
+          if [ -n "$FOUND" ]; then
+            CONFIG_FILE="$FOUND"
+          fi
+        fi
+
+        if [ -z "$CONFIG_FILE" ]; then
+          echo "❌ defconfig not found. Full list:"
+          ls -la "$CFG_DIR"
           exit 1
         fi
 
         echo "✅ Using defconfig: $CONFIG_FILE"
+        echo "== Before patch (related lines) =="
+        grep -nE "CONFIG_SONY_CXD224X=|CONFIG_NFC_PN553=|# CONFIG_NFC_PN553 is not set" "$CONFIG_FILE" || true
 
         set_kcfg() {
           local key="$1" val="$2" file="$3"
@@ -189,11 +220,19 @@ jobs:
           fi
         }
 
+        # ✅ 打开 Sony CXD224X
         set_kcfg CONFIG_SONY_CXD224X y "$CONFIG_FILE"
-        set_kcfg CONFIG_NFC_PN553 n "$CONFIG_FILE"
 
-        echo "== defconfig result =="
-        grep -nE "CONFIG_SONY_CXD224X=|CONFIG_NFC_PN553=" "$CONFIG_FILE" || true
+        # ✅ 关闭 PN553（用两种方式保证最终是 off）
+        # 1) 如果存在 CONFIG_NFC_PN553=... 就改成 n
+        set_kcfg CONFIG_NFC_PN553 n "$CONFIG_FILE"
+        # 2) 补一句更常见的 Kconfig 关闭写法（避免某些构建系统忽略 =n）
+        if ! grep -qE "^# CONFIG_NFC_PN553 is not set" "$CONFIG_FILE"; then
+          echo "# CONFIG_NFC_PN553 is not set" >> "$CONFIG_FILE"
+        fi
+
+        echo "== After patch (verify) =="
+        grep -nE "CONFIG_SONY_CXD224X=|CONFIG_NFC_PN553=|# CONFIG_NFC_PN553 is not set" "$CONFIG_FILE" || true
 
     - name: DT sanity check (does maple DTS mention cxd224x/bd7602?)
       run: |
